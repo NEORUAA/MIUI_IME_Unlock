@@ -82,7 +82,10 @@ private val WETYPE_DRAWABLE_REPLACEMENTS = mapOf(
 private data class WeTypeWindowState(
     var blurApplyToken: Int = 0,
     var blurEligible: Boolean = false,
-    var backgroundCarrier: View? = null
+    var backgroundCarrier: View? = null,
+    var inputMethodService: Any? = null,
+    var heightChangeListener: View.OnLayoutChangeListener? = null,
+    var registeredViews: MutableList<View> = mutableListOf()
 )
 
 private data class WeTypeViewSnapshot(
@@ -447,7 +450,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
             if (snapshot.isLayoutReady()) {
                 // 避免在 SoftInputWindow 首次测量前改动窗口背景，先等视图具备稳定尺寸。
-                applyWeTypeBackgroundCarrier(window, decorView, context, state, snapshot)
+                applyWeTypeBackgroundCarrier(inputMethodService, window, decorView, context, state, snapshot)
                 scheduleWeTypeBackgroundSettle(inputMethodService, token, WETYPE_BACKGROUND_SETTLE_RETRY)
                 return
             }
@@ -495,6 +498,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         return@runCatching
                     }
                     applyWeTypeBackgroundCarrier(
+                        inputMethodService,
                         latestWindow,
                         latestDecorView,
                         context,
@@ -561,6 +565,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     private fun applyWeTypeBackgroundCarrier(
+        inputMethodService: Any,
         window: Window,
         decorView: View,
         context: Context,
@@ -574,7 +579,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         val decorHeight = snapshot.decorView?.height ?: decorGroup.height
         val backgroundTop = snapshot.backgroundTop().coerceIn(0, decorHeight)
         val backgroundHeight = (decorHeight - backgroundTop).coerceAtLeast(0)
-        val carrier = ensureWeTypeBackgroundCarrier(context, decorGroup, state)
+        val carrier = ensureWeTypeBackgroundCarrier(context, decorGroup, state, inputMethodService)
         val layoutParams = (carrier.layoutParams as? FrameLayout.LayoutParams)
             ?: FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -584,20 +589,82 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         layoutParams.height = backgroundHeight
         layoutParams.topMargin = backgroundTop
         carrier.layoutParams = layoutParams
-        carrier.visibility = if (backgroundHeight > 0) View.VISIBLE else View.GONE
+
         val radius = TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP,
             WeTypeSettings.getCornerRadiusXposed(context).toFloat(),
             context.resources.displayMetrics
         )
+
+        // 当目标高度小于圆角半径时，不绘制背景
+        if (backgroundHeight < radius) {
+            carrier.visibility = View.GONE
+            carrier.background = null
+            return
+        }
+
+        carrier.visibility = View.VISIBLE
         applyContinuousTopCornerOutline(carrier, radius)
         carrier.background = createWeTypeBackgroundDrawable(carrier, context)
+
+        // 每次应用背景时重新注册高度监听器到最新的输入法视图上
+        // 横竖屏切换后视图会重建，需要重新注册
+        setupHeightChangeListeners(inputMethodService, context, state)
+    }
+
+    private fun setupHeightChangeListeners(
+        inputMethodService: Any,
+        context: Context,
+        state: WeTypeWindowState
+    ) {
+        // 清理旧 View 上的监听器
+        state.registeredViews.forEach { view ->
+            state.heightChangeListener?.let { view.removeOnLayoutChangeListener(it) }
+        }
+        state.registeredViews.clear()
+
+        // 创建监听器：监听输入法内容视图的高度变化，重新绘制背景
+        val listener = View.OnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+            val oldHeight = oldBottom - oldTop
+            val newHeight = bottom - top
+            if (oldHeight == newHeight) return@OnLayoutChangeListener
+
+            runCatching {
+                val ims = state.inputMethodService ?: return@runCatching
+                val softInputWindow = ims.invokeMethodAs<Any>("getWindow") ?: return@runCatching
+                val window = softInputWindow.invokeMethodAs<Window>("getWindow") ?: return@runCatching
+                val decorView = window.decorView ?: return@runCatching
+                val snapshot = collectWeTypeWindowSnapshot(ims) ?: return@runCatching
+                if (snapshot.isLayoutReady()) {
+                    applyWeTypeBackgroundCarrier(ims, window, decorView, context, state, snapshot)
+                }
+            }.onFailure {
+                Log.i("Failed: Reapply background on height change")
+                Log.i(it)
+            }
+        }
+        state.heightChangeListener = listener
+
+        // 为输入法内容视图添加监听器（候选词区、输入区、输入视图），并保存引用
+        readWeTypeViewField(inputMethodService, "mCandidatesFrame")?.also {
+            it.addOnLayoutChangeListener(listener)
+            state.registeredViews.add(it)
+        }
+        readWeTypeViewField(inputMethodService, "mInputFrame")?.also {
+            it.addOnLayoutChangeListener(listener)
+            state.registeredViews.add(it)
+        }
+        runCatching { inputMethodService.invokeMethodAs<View>("getInputView") }.getOrNull()?.also {
+            it.addOnLayoutChangeListener(listener)
+            state.registeredViews.add(it)
+        }
     }
 
     private fun ensureWeTypeBackgroundCarrier(
         context: Context,
         decorGroup: ViewGroup,
-        state: WeTypeWindowState
+        state: WeTypeWindowState,
+        inputMethodService: Any
     ): View {
         val existing = state.backgroundCarrier?.takeIf { it.parent === decorGroup }
         if (existing != null) return existing
@@ -616,6 +683,8 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             )
         )
         state.backgroundCarrier = carrier
+        state.inputMethodService = inputMethodService
+
         return carrier
     }
 
