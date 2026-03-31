@@ -8,7 +8,6 @@ import android.content.Context
 import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.Outline
-import android.graphics.PorterDuffColorFilter
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
@@ -66,10 +65,18 @@ private val WETYPE_SMOOTH_CONTINUITY = G2Continuity(
     capsuleProfile = G2ContinuityProfile.Capsule
 )
 private val WETYPE_COLOR_REPLACEMENTS = mapOf(
-    0xFFE1E3E8.toInt() to Color.TRANSPARENT,
-    0xFFE5E6EB.toInt() to Color.TRANSPARENT,
-    0xFF202020.toInt() to Color.TRANSPARENT,
-    0xFFD5D7DD.toInt() to Color.TRANSPARENT
+    "g8" to Color.TRANSPARENT,
+    "gb" to Color.TRANSPARENT,
+    "k5" to Color.TRANSPARENT,
+    "k9" to Color.TRANSPARENT,
+    "ng" to Color.TRANSPARENT,
+    "pq" to Color.TRANSPARENT
+)
+private val WETYPE_DRAWABLE_REPLACEMENTS = mapOf(
+    "ic" to R.drawable.wetype_ic,
+    "gi" to R.drawable.wetype_gi,
+    "ib" to R.drawable.wetype_ib,
+    "gj" to R.drawable.wetype_gj,
 )
 
 private data class WeTypeWindowState(
@@ -122,6 +129,8 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private var navBarColor: Int? = null
     private var bottomViewSourceColor: Int? = null
     private lateinit var modulePath: String
+    private var moduleAssetManager: AssetManager? = null
+    private var moduleResources: Resources? = null
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
         modulePath = startupParam.modulePath
@@ -146,6 +155,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         if (isWeType) {
             hookWeTypeFont()
             hookWeTypeTransparentColors()
+            hookWeTypeXmlDrawables()
             hookWeTypeWindowBlur()
             hookWeTypeWindowCorner()
         }
@@ -199,19 +209,13 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private fun hookWeTypeFont() {
         runCatching {
-            val moduleAssetManager = AssetManager::class.java.getDeclaredConstructor().newInstance()
-            val addAssetPath = AssetManager::class.java.getMethod("addAssetPath", String::class.java)
-            check(addAssetPath.invoke(moduleAssetManager, modulePath) as Int != 0) {
-                "Failed to add module asset path: $modulePath"
-            }
-
             Typeface::class.java.getDeclaredMethod(
                 "createFromAsset",
                 AssetManager::class.java,
                 String::class.java
             ).hookBefore { param ->
                 if (param.args[1] != WETYPE_FONT_ASSET) return@hookBefore
-                param.result = Typeface.createFromAsset(moduleAssetManager, MODULE_WETYPE_FONT_ASSET)
+                param.result = Typeface.createFromAsset(getModuleAssetManager(), MODULE_WETYPE_FONT_ASSET)
             }
             Log.i("Success: Hook WeType font replacement")
         }.onFailure {
@@ -220,89 +224,127 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         }
     }
 
+    private fun hookWeTypeXmlDrawables() {
+        runCatching {
+            Resources::class.java.getMethod("getDrawable", Int::class.javaPrimitiveType)
+                .hookAfter { param ->
+                    val resources = param.thisObject as? Resources ?: return@hookAfter
+                    val resId = param.args[0] as? Int ?: return@hookAfter
+                    replaceWeTypeDrawable(resources, resId, null)?.also { param.result = it }
+                }
+            Resources::class.java.getMethod(
+                "getDrawable",
+                Int::class.javaPrimitiveType,
+                Resources.Theme::class.java
+            ).hookAfter { param ->
+                val resources = param.thisObject as? Resources ?: return@hookAfter
+                val resId = param.args[0] as? Int ?: return@hookAfter
+                val theme = param.args[1] as? Resources.Theme
+                replaceWeTypeDrawable(resources, resId, theme)?.also { param.result = it }
+            }
+            runCatching {
+                Resources::class.java.getMethod(
+                    "getDrawableForDensity",
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType
+                ).hookAfter { param ->
+                    val resources = param.thisObject as? Resources ?: return@hookAfter
+                    val resId = param.args[0] as? Int ?: return@hookAfter
+                    replaceWeTypeDrawable(resources, resId, null)?.also { param.result = it }
+                }
+            }
+            runCatching {
+                Resources::class.java.getMethod(
+                    "getDrawableForDensity",
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Resources.Theme::class.java
+                ).hookAfter { param ->
+                    val resources = param.thisObject as? Resources ?: return@hookAfter
+                    val resId = param.args[0] as? Int ?: return@hookAfter
+                    val theme = param.args[2] as? Resources.Theme
+                    replaceWeTypeDrawable(resources, resId, theme)?.also { param.result = it }
+                }
+            }
+            TypedArray::class.java.getMethod("getDrawable", Int::class.javaPrimitiveType)
+                .hookAfter { param ->
+                    val typedArray = param.thisObject as? TypedArray ?: return@hookAfter
+                    val index = param.args[0] as? Int ?: return@hookAfter
+                    val resId = typedArray.getResourceId(index, 0)
+                    if (resId == 0) return@hookAfter
+                    replaceWeTypeDrawable(typedArray.resources, resId, null)?.also { param.result = it }
+                }
+            Log.i("Success: Hook WeType xml drawables")
+        }.onFailure {
+            Log.i("Failed: Hook WeType xml drawables")
+            Log.i(it)
+        }
+    }
+
     private fun hookWeTypeTransparentColors() {
         runCatching {
             Resources::class.java.getMethod("getColor", Int::class.javaPrimitiveType)
                 .hookAfter { param ->
-                    param.result = replaceWeTypeColor(param.result as Int)
+                    val resources = param.thisObject as? Resources ?: return@hookAfter
+                    val colorResId = param.args[0] as? Int ?: return@hookAfter
+                    param.result = replaceWeTypeColor(resources, colorResId, param.result as Int)
                 }
             Resources::class.java.getMethod(
                 "getColor",
                 Int::class.javaPrimitiveType,
                 Resources.Theme::class.java
             ).hookAfter { param ->
-                param.result = replaceWeTypeColor(param.result as Int)
+                val resources = param.thisObject as? Resources ?: return@hookAfter
+                val colorResId = param.args[0] as? Int ?: return@hookAfter
+                param.result = replaceWeTypeColor(resources, colorResId, param.result as Int)
             }
             Resources::class.java.getMethod("getColorStateList", Int::class.javaPrimitiveType)
                 .hookAfter { param ->
-                    param.result = replaceWeTypeColorStateList(param.result as ColorStateList)
+                    val resources = param.thisObject as? Resources ?: return@hookAfter
+                    val colorResId = param.args[0] as? Int ?: return@hookAfter
+                    param.result = replaceWeTypeColorStateList(
+                        resources,
+                        colorResId,
+                        param.result as ColorStateList
+                    )
                 }
             Resources::class.java.getMethod(
                 "getColorStateList",
                 Int::class.javaPrimitiveType,
                 Resources.Theme::class.java
             ).hookAfter { param ->
-                param.result = replaceWeTypeColorStateList(param.result as ColorStateList)
+                val resources = param.thisObject as? Resources ?: return@hookAfter
+                val colorResId = param.args[0] as? Int ?: return@hookAfter
+                param.result = replaceWeTypeColorStateList(
+                    resources,
+                    colorResId,
+                    param.result as ColorStateList
+                )
             }
             TypedArray::class.java.getMethod(
                 "getColor",
                 Int::class.javaPrimitiveType,
                 Int::class.javaPrimitiveType
             ).hookAfter { param ->
-                param.result = replaceWeTypeColor(param.result as Int)
+                val typedArray = param.thisObject as? TypedArray ?: return@hookAfter
+                val index = param.args[0] as? Int ?: return@hookAfter
+                val colorResId = typedArray.getResourceId(index, 0)
+                if (colorResId == 0) return@hookAfter
+                param.result = replaceWeTypeColor(typedArray.resources, colorResId, param.result as Int)
             }
             TypedArray::class.java.getMethod("getColorStateList", Int::class.javaPrimitiveType)
                 .hookAfter { param ->
+                    val typedArray = param.thisObject as? TypedArray ?: return@hookAfter
+                    val index = param.args[0] as? Int ?: return@hookAfter
+                    val colorResId = typedArray.getResourceId(index, 0)
+                    if (colorResId == 0) return@hookAfter
                     val colorStateList = param.result as? ColorStateList ?: return@hookAfter
-                    param.result = replaceWeTypeColorStateList(colorStateList)
+                    param.result = replaceWeTypeColorStateList(
+                        typedArray.resources,
+                        colorResId,
+                        colorStateList
+                    )
                 }
-            View::class.java.getMethod("setBackgroundColor", Int::class.javaPrimitiveType)
-                .hookBefore { param ->
-                    param.args[0] = replaceWeTypeColor(param.args[0] as Int)
-                }
-            GradientDrawable::class.java.getMethod("setColor", Int::class.javaPrimitiveType)
-                .hookBefore { param ->
-                    param.args[0] = replaceWeTypeColor(param.args[0] as Int)
-                }
-            runCatching {
-                GradientDrawable::class.java.getMethod("setColors", IntArray::class.java)
-                    .hookBefore { param ->
-                        val colors = param.args[0] as? IntArray ?: return@hookBefore
-                        param.args[0] = colors.map(::replaceWeTypeColor).toIntArray()
-                    }
-            }
-            ColorDrawable::class.java.getMethod("setColor", Int::class.javaPrimitiveType)
-                .hookBefore { param ->
-                    param.args[0] = replaceWeTypeColor(param.args[0] as Int)
-                }
-            runCatching {
-                Drawable::class.java.getMethod(
-                    "setTint",
-                    Int::class.javaPrimitiveType
-                ).hookBefore { param ->
-                    param.args[0] = replaceWeTypeColor(param.args[0] as Int)
-                }
-            }
-            runCatching {
-                Drawable::class.java.getMethod(
-                    "setColorFilter",
-                    Int::class.javaPrimitiveType,
-                    android.graphics.PorterDuff.Mode::class.java
-                ).hookBefore { param ->
-                    param.args[0] = replaceWeTypeColor(param.args[0] as Int)
-                }
-            }
-            runCatching {
-                Drawable::class.java.getMethod(
-                    "setColorFilter",
-                    android.graphics.ColorFilter::class.java
-                ).hookBefore { param ->
-                    val colorFilter = param.args[0] as? PorterDuffColorFilter ?: return@hookBefore
-                    val colorField = PorterDuffColorFilter::class.java.getDeclaredField("mColor")
-                    colorField.isAccessible = true
-                    colorField.setInt(colorFilter, replaceWeTypeColor(colorField.getInt(colorFilter)))
-                }
-            }
             Log.i("Success: Hook WeType transparent colors")
         }.onFailure {
             Log.i("Failed: Hook WeType transparent colors")
@@ -703,12 +745,53 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         view.invalidateOutline()
     }
 
-    private fun replaceWeTypeColor(color: Int): Int = WETYPE_COLOR_REPLACEMENTS[color] ?: color
+    private fun replaceWeTypeColor(resources: Resources, colorResId: Int, color: Int): Int {
+        val colorName = runCatching { resources.getResourceEntryName(colorResId) }.getOrNull() ?: return color
+        return WETYPE_COLOR_REPLACEMENTS[colorName] ?: color
+    }
 
-    private fun replaceWeTypeColorStateList(colorStateList: ColorStateList): ColorStateList {
-        val replacedColor = replaceWeTypeColor(colorStateList.defaultColor)
+    private fun replaceWeTypeDrawable(
+        resources: Resources,
+        drawableResId: Int,
+        theme: Resources.Theme?
+    ): Drawable? {
+        val drawableName = runCatching {
+            resources.getResourceEntryName(drawableResId)
+        }.getOrNull() ?: return null
+        val replacementResId = WETYPE_DRAWABLE_REPLACEMENTS[drawableName] ?: return null
+        val replacementDrawable = getModuleResources(resources).getDrawable(replacementResId, null)
+        return replacementDrawable.constantState?.newDrawable(resources, theme)?.mutate()
+            ?: replacementDrawable.mutate()
+    }
+
+    private fun replaceWeTypeColorStateList(
+        resources: Resources,
+        colorResId: Int,
+        colorStateList: ColorStateList
+    ): ColorStateList {
+        val replacedColor = replaceWeTypeColor(resources, colorResId, colorStateList.defaultColor)
         if (replacedColor == colorStateList.defaultColor) return colorStateList
         return ColorStateList.valueOf(replacedColor)
+    }
+
+    private fun getModuleAssetManager(): AssetManager {
+        moduleAssetManager?.let { return it }
+        val assetManager = AssetManager::class.java.getDeclaredConstructor().newInstance()
+        val addAssetPath = AssetManager::class.java.getMethod("addAssetPath", String::class.java)
+        check(addAssetPath.invoke(assetManager, modulePath) as Int != 0) {
+            "Failed to add module asset path: $modulePath"
+        }
+        moduleAssetManager = assetManager
+        return assetManager
+    }
+
+    private fun getModuleResources(baseResources: Resources): Resources {
+        moduleResources?.let { return it }
+        return Resources(
+            getModuleAssetManager(),
+            baseResources.displayMetrics,
+            baseResources.configuration
+        ).also { moduleResources = it }
     }
 
     /**
