@@ -16,7 +16,6 @@ import android.graphics.Shader
 import android.graphics.drawable.Drawable
 import android.util.TypedValue
 import kotlin.math.cos
-import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -293,12 +292,14 @@ internal class WeTypeBloomStrokeDrawable(
         val directionY = -cos(radians).toFloat()
         val centerX = rect.centerX()
         val centerY = rect.centerY()
-        val halfDiagonal = hypot(rect.width(), rect.height()) / 2f
+        val halfExtent =
+            (kotlin.math.abs(directionX) * rect.width() +
+                kotlin.math.abs(directionY) * rect.height()) / 2f
         return LinearGradient(
-            centerX - directionX * halfDiagonal,
-            centerY - directionY * halfDiagonal,
-            centerX + directionX * halfDiagonal,
-            centerY + directionY * halfDiagonal,
+            centerX - directionX * halfExtent,
+            centerY - directionY * halfExtent,
+            centerX + directionX * halfExtent,
+            centerY + directionY * halfExtent,
             colors,
             positions,
             Shader.TileMode.CLAMP
