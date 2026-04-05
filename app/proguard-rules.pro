@@ -22,7 +22,7 @@
 
 -repackageclasses "miuiime"
 
--keep class com.xposed.miuiime.MainHook {
+-keep class com.xposed.wetypehook.MainHook {
     <init>();
 }
 

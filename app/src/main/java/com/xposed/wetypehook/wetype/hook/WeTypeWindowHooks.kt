@@ -1,4 +1,4 @@
-package com.xposed.miuiime.wetype.hook
+package com.xposed.wetypehook.wetype.hook
 
 import android.content.Context
 import android.graphics.Color
@@ -18,10 +18,10 @@ import com.github.kyuubiran.ezxhelper.utils.getObjectAs
 import com.github.kyuubiran.ezxhelper.utils.hookAfter
 import com.github.kyuubiran.ezxhelper.utils.invokeMethodAs
 import com.github.kyuubiran.ezxhelper.utils.loadClassOrNull
-import com.xposed.miuiime.wetype.graphics.WeTypeBloomStrokeDrawable
-import com.xposed.miuiime.wetype.graphics.WeTypeCornerRadii
-import com.xposed.miuiime.wetype.graphics.createWeTypeContinuousRoundedPath
-import com.xposed.miuiime.wetype.settings.WeTypeSettings
+import com.xposed.wetypehook.wetype.graphics.WeTypeBloomStrokeDrawable
+import com.xposed.wetypehook.wetype.graphics.WeTypeCornerRadii
+import com.xposed.wetypehook.wetype.graphics.createWeTypeContinuousRoundedPath
+import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import java.util.WeakHashMap
 
 private const val WETYPE_BLUR_APPLY_MAX_RETRY = 6

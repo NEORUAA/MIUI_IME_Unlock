@@ -1,4 +1,4 @@
-package com.xposed.miuiime.wetype.hook
+package com.xposed.wetypehook.wetype.hook
 
 import android.content.Context
 import android.content.res.AssetManager
@@ -14,7 +14,7 @@ import com.github.kyuubiran.ezxhelper.utils.hookAfter
 import com.github.kyuubiran.ezxhelper.utils.hookBefore
 import com.github.kyuubiran.ezxhelper.utils.hookReturnConstant
 import com.github.kyuubiran.ezxhelper.utils.loadClassOrNull
-import com.xposed.miuiime.wetype.settings.WeTypeSettings
+import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 
 internal object WeTypeResourceHooks {
     fun hookFont(

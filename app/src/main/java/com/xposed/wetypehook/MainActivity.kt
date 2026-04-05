@@ -1,4 +1,4 @@
-package com.xposed.miuiime
+package com.xposed.wetypehook
 
 import android.app.Activity
 import android.content.Context
@@ -53,12 +53,11 @@ import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
-import com.kyant.capsule.ContinuousRectangle
 import com.kyant.capsule.ContinuousRoundedRectangle
-import com.xposed.miuiime.wetype.graphics.WeTypeBloomStrokeDrawable
-import com.xposed.miuiime.wetype.graphics.WeTypeCornerRadii
-import com.xposed.miuiime.wetype.graphics.createWeTypeContinuousRoundedPath
-import com.xposed.miuiime.wetype.settings.WeTypeSettings
+import com.xposed.wetypehook.wetype.graphics.WeTypeBloomStrokeDrawable
+import com.xposed.wetypehook.wetype.graphics.WeTypeCornerRadii
+import com.xposed.wetypehook.wetype.graphics.createWeTypeContinuousRoundedPath
+import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import top.yukonga.miuix.kmp.basic.BasicComponent
 import top.yukonga.miuix.kmp.basic.BasicComponentDefaults
 import top.yukonga.miuix.kmp.basic.Card
@@ -71,10 +70,8 @@ import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Slider
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Switch
-import top.yukonga.miuix.kmp.basic.TabRow
 import top.yukonga.miuix.kmp.basic.TabRowWithContour
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.basic.rememberTopAppBarState

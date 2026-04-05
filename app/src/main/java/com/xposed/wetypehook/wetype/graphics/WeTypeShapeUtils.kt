@@ -1,4 +1,4 @@
-package com.xposed.miuiime.wetype.graphics
+package com.xposed.wetypehook.wetype.graphics
 
 import android.graphics.Path
 import androidx.compose.foundation.shape.CornerSize

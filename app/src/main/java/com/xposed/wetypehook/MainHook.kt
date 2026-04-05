@@ -1,4 +1,4 @@
-package com.xposed.miuiime
+package com.xposed.wetypehook
 
 import android.content.IntentFilter
 import android.content.res.AssetManager
@@ -19,9 +19,9 @@ import com.github.kyuubiran.ezxhelper.utils.invokeStaticMethodAuto
 import com.github.kyuubiran.ezxhelper.utils.loadClassOrNull
 import com.github.kyuubiran.ezxhelper.utils.putStaticObject
 import com.github.kyuubiran.ezxhelper.utils.sameAs
-import com.xposed.miuiime.wetype.settings.WeTypeSettings
-import com.xposed.miuiime.wetype.hook.WeTypeResourceHooks
-import com.xposed.miuiime.wetype.hook.WeTypeWindowHooks
+import com.xposed.wetypehook.wetype.settings.WeTypeSettings
+import com.xposed.wetypehook.wetype.hook.WeTypeResourceHooks
+import com.xposed.wetypehook.wetype.hook.WeTypeWindowHooks
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.callbacks.XC_LoadPackage

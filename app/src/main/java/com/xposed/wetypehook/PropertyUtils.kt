@@ -1,4 +1,4 @@
-package com.xposed.miuiime
+package com.xposed.wetypehook
 
 import android.annotation.SuppressLint
 import de.robv.android.xposed.XposedBridge

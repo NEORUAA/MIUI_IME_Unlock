@@ -1,4 +1,4 @@
-package com.xposed.miuiime.wetype.settings
+package com.xposed.wetypehook.wetype.settings
 
 import android.content.Context
 import android.content.SharedPreferences

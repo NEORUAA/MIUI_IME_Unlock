@@ -1,4 +1,4 @@
-package com.xposed.miuiime.wetype.graphics
+package com.xposed.wetypehook.wetype.graphics
 
 import android.content.Context
 import android.content.res.Configuration

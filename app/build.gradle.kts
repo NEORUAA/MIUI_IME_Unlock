@@ -7,10 +7,10 @@ plugins {
 
 android {
     compileSdk = 37
-    namespace = "com.xposed.miuiime"
+    namespace = "com.xposed.wetypehook"
 
     defaultConfig {
-        applicationId = "com.xposed.miuiime"
+        applicationId = "com.xposed.wetypehook"
         minSdk = 31
         targetSdk = 37
         versionCode = 18
@@ -40,7 +40,7 @@ android {
         }
     }
     applicationVariants.all {
-        val outputFileName = "Unlock_MIUI_IME-${versionName}_${buildType.name}.apk"
+        val outputFileName = "WeType_UI_Enhanced-${versionName}_${buildType.name}.apk"
         outputs.all {
             val output = this as? com.android.build.gradle.internal.api.BaseVariantOutputImpl
             output?.outputFileName = outputFileName
