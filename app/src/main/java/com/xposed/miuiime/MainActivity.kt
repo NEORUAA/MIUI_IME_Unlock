@@ -62,6 +62,8 @@ import top.yukonga.miuix.kmp.basic.BasicComponentDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
+import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Slider
@@ -75,6 +77,8 @@ import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.basic.rememberTopAppBarState
 import top.yukonga.miuix.kmp.preference.ArrowPreference
+import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.Refresh
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.darkColorScheme
 import top.yukonga.miuix.kmp.theme.lightColorScheme
@@ -99,13 +103,17 @@ class MainActivity : ComponentActivity() {
                 return@Thread
             }
 
-            val restarted = runRootCommand(
-                "killall com.tencent.wetype || pkill -f com.tencent.wetype || am force-stop com.tencent.wetype"
-            )
+            var restarted = false
+            while (!restarted) {
+                restarted = runRootCommand(
+                    "killall com.tencent.wetype || pkill -f com.tencent.wetype || am force-stop com.tencent.wetype"
+                )
+                if (!restarted) {
+                    Thread.sleep(300)
+                }
+            }
             runOnUiThread {
-                val message =
-                    if (restarted) R.string.settings_restart_done else R.string.settings_restart_failed
-                Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, R.string.settings_restart_done, Toast.LENGTH_SHORT).show()
             }
         }.start()
     }
@@ -180,7 +188,7 @@ private fun WeTypeSettingsScreen(
         if (currentModeIsDark) darkColor = argb else lightColor = argb
     }
 
-    fun saveSettings() {
+    fun saveSettings(showSavedToast: Boolean = true) {
         WeTypeSettings.save(
             context = context,
             lightColor = lightColor,
@@ -191,7 +199,23 @@ private fun WeTypeSettingsScreen(
             edgeHighlightIntensity = edgeHighlightIntensity,
             keyOpacity = keyOpacity
         )
-        Toast.makeText(context, R.string.settings_saved, Toast.LENGTH_SHORT).show()
+        if (showSavedToast) {
+            Toast.makeText(context, R.string.settings_saved, Toast.LENGTH_SHORT).show()
+        }
+        onRestartWeType()
+    }
+
+    fun restoreDefaults() {
+        lightColor = WeTypeSettings.DEFAULT_LIGHT_COLOR
+        darkColor = WeTypeSettings.DEFAULT_DARK_COLOR
+        blurRadius = WeTypeSettings.DEFAULT_BLUR_RADIUS
+        cornerRadius = WeTypeSettings.DEFAULT_CORNER_RADIUS
+        edgeHighlightEnabled = WeTypeSettings.DEFAULT_EDGE_HIGHLIGHT_ENABLED
+        edgeHighlightIntensity = WeTypeSettings.DEFAULT_EDGE_HIGHLIGHT_INTENSITY
+        keyOpacity = WeTypeSettings.DEFAULT_KEY_OPACITY
+        syncEditorFromState()
+        Toast.makeText(context, context.getString(R.string.settings_reset_toast), Toast.LENGTH_SHORT).show()
+        saveSettings(showSavedToast = false)
     }
 
     val previewColor = currentColor()
@@ -201,7 +225,28 @@ private fun WeTypeSettingsScreen(
         topBar = {
             TopAppBar(
                 title = stringResource(R.string.settings_title),
-                scrollBehavior = scrollBehavior
+                scrollBehavior = scrollBehavior,
+                actions = {
+                    IconButton(
+                        onClick = ::restoreDefaults
+                    ) {
+                        Icon(
+                            imageVector = MiuixIcons.Refresh,
+                            contentDescription = stringResource(R.string.settings_reset_title)
+                        )
+                    }
+                },
+                bottomContent = {
+                    PreviewSection(
+                        color = previewColor,
+                        blurRadius = blurRadius,
+                        cornerRadius = cornerRadius,
+                        edgeHighlightEnabled = edgeHighlightEnabled,
+                        edgeHighlightIntensity = edgeHighlightIntensity,
+                        keyOpacity = keyOpacity,
+                        isDark = currentModeIsDark
+                    )
+                }
             )
         }
     ) { paddingValues ->
@@ -216,42 +261,6 @@ private fun WeTypeSettingsScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // 预览
-            item {
-                SmallTitle(
-                    text = stringResource(R.string.settings_preview_title)
-                )
-                Card(
-                    modifier = Modifier.padding(horizontal = 16.dp),
-                    insideMargin = PaddingValues(0.dp),
-                    colors = CardDefaults.defaultColors(
-                        color = ComposeColor.Transparent
-                    )
-                ) {
-                    Box(
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Image(
-                            painter = painterResource(R.drawable.natural_texture_004),
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.matchParentSize()
-                        )
-                        Column {
-                            // 大预览卡片
-                            PreviewCard(
-                                color = previewColor,
-                                blurRadius = blurRadius,
-                                cornerRadius = cornerRadius,
-                                edgeHighlightEnabled = edgeHighlightEnabled,
-                                edgeHighlightIntensity = edgeHighlightIntensity,
-                                keyOpacity = keyOpacity,
-                                isDark = currentModeIsDark
-                            )
-                        }
-                    }
-                }
-            }
             // 颜色分组
             item {
                 SmallTitle(
@@ -424,32 +433,6 @@ private fun WeTypeSettingsScreen(
 
                         HorizontalDivider()
 
-                        ArrowPreference(
-                            title = stringResource(R.string.settings_reset_title),
-                            summary = stringResource(R.string.settings_reset_desc),
-                            onClick = {
-                                lightColor = WeTypeSettings.DEFAULT_LIGHT_COLOR
-                                darkColor = WeTypeSettings.DEFAULT_DARK_COLOR
-                                blurRadius = WeTypeSettings.DEFAULT_BLUR_RADIUS
-                                cornerRadius = WeTypeSettings.DEFAULT_CORNER_RADIUS
-                                edgeHighlightEnabled = WeTypeSettings.DEFAULT_EDGE_HIGHLIGHT_ENABLED
-                                edgeHighlightIntensity = WeTypeSettings.DEFAULT_EDGE_HIGHLIGHT_INTENSITY
-                                keyOpacity = WeTypeSettings.DEFAULT_KEY_OPACITY
-                                syncEditorFromState()
-                                Toast.makeText(context, context.getString(R.string.settings_reset_toast), Toast.LENGTH_SHORT).show()
-                            }
-                        )
-
-                        HorizontalDivider()
-
-                        ArrowPreference(
-                            title = stringResource(R.string.settings_restart_title),
-                            summary = stringResource(R.string.settings_restart_desc),
-                            onClick = onRestartWeType
-                        )
-
-                        HorizontalDivider()
-
                         BasicComponent(
                             title = stringResource(R.string.settings_visit_github_title),
                             titleColor = BasicComponentDefaults.titleColor(
@@ -464,6 +447,54 @@ private fun WeTypeSettingsScreen(
                             }
                         )
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PreviewSection(
+    color: Int,
+    blurRadius: Int,
+    cornerRadius: Int,
+    edgeHighlightEnabled: Boolean,
+    edgeHighlightIntensity: Int,
+    keyOpacity: Int,
+    isDark: Boolean
+) {
+    Column(
+        modifier = Modifier.padding(bottom = 16.dp)
+    ) {
+        SmallTitle(
+            text = stringResource(R.string.settings_preview_title)
+        )
+        Card(
+            modifier = Modifier.padding(horizontal = 16.dp),
+            insideMargin = PaddingValues(0.dp),
+            colors = CardDefaults.defaultColors(
+                color = ComposeColor.Transparent
+            )
+        ) {
+            Box(
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Image(
+                    painter = painterResource(R.drawable.natural_texture_004),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.matchParentSize()
+                )
+                Column {
+                    PreviewCard(
+                        color = color,
+                        blurRadius = blurRadius,
+                        cornerRadius = cornerRadius,
+                        edgeHighlightEnabled = edgeHighlightEnabled,
+                        edgeHighlightIntensity = edgeHighlightIntensity,
+                        keyOpacity = keyOpacity,
+                        isDark = isDark
+                    )
                 }
             }
         }
