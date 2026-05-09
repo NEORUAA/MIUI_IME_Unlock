@@ -86,8 +86,8 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         HookEnvironment.init(lpparam.classLoader, TAG)
 
-        val isMiuiImeSupport = PropertyUtils["ro.miui.support_miui_ime_bottom", "0"] == "1"
-
+        if (lpparam.packageName != WETYPE_PACKAGE && PropertyUtils["ro.miui.support_miui_ime_bottom", "0"] != "1") return
+    
         if (lpparam.packageName == "android") {
             if (isMiuiImeSupport) {
                 startPermissionHook()
