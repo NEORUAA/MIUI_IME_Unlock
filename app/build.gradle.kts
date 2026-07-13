@@ -13,8 +13,8 @@ android {
         applicationId = "com.xposed.wetypehook"
         minSdk = 31
         targetSdk = 37
-        versionCode = 28
-        versionName = "1.26.0"
+        versionCode = 29
+        versionName = "1.26.1"
     }
 
     buildTypes {
@@ -57,13 +57,13 @@ kotlin {
 dependencies {
     compileOnly("de.robv.android.xposed:api:82")
     implementation("androidx.activity:activity-compose:1.13.0")
-    implementation("androidx.compose.foundation:foundation-android:1.11.2")
-    implementation("androidx.compose.ui:ui-android:1.11.2")
-    implementation("androidx.compose.ui:ui-graphics-android:1.11.2")
-    implementation("androidx.compose.ui:ui-text-android:1.11.2")
-    implementation("top.yukonga.miuix.kmp:miuix-ui-android:0.9.2")
-    implementation("top.yukonga.miuix.kmp:miuix-preference-android:0.9.2")
-    implementation("top.yukonga.miuix.kmp:miuix-core-android:0.9.2")
+    implementation("androidx.compose.foundation:foundation-android:1.11.4")
+    implementation("androidx.compose.ui:ui-android:1.11.4")
+    implementation("androidx.compose.ui:ui-graphics-android:1.11.4")
+    implementation("androidx.compose.ui:ui-text-android:1.11.4")
+    implementation("top.yukonga.miuix.kmp:miuix-ui-android:0.9.3")
+    implementation("top.yukonga.miuix.kmp:miuix-preference-android:0.9.3")
+    implementation("top.yukonga.miuix.kmp:miuix-core-android:0.9.3")
     implementation("top.yukonga.miuix.kmp:miuix-shapes-android:0.9.0")
     implementation("top.yukonga.miuix.kmp:miuix-icons-android:0.9.0") {
         exclude(group = "top.yukonga.miuix.kmp", module = "miuix-android")
