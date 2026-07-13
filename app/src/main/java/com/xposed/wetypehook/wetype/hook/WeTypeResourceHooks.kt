@@ -5,18 +5,20 @@ import android.content.res.AssetManager
 import android.content.res.ColorStateList
 import android.content.res.Resources
 import android.content.res.TypedArray
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.View
-import android.widget.FrameLayout
 import com.xposed.wetypehook.xposed.Log
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedHelpers
 import com.xposed.wetypehook.xposed.findMethod
+import com.xposed.wetypehook.xposed.findMethodInHierarchy
 import com.xposed.wetypehook.xposed.getObjectAs
 import com.xposed.wetypehook.xposed.hookAfter
 import com.xposed.wetypehook.xposed.hookBefore
@@ -29,6 +31,8 @@ import com.xposed.wetypehook.wetype.settings.WeTypeAppearanceColorGroups
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import com.xposed.wetypehook.wetype.settings.LIGHT_KEY_COLOR_GROUP_ID
 import com.xposed.wetypehook.wetype.settings.DARK_KEY_COLOR_GROUP_ID
+import java.lang.reflect.Method
+import java.lang.reflect.Modifier
 import java.util.Collections
 import java.util.WeakHashMap
 import kotlin.math.roundToInt
@@ -50,14 +54,15 @@ internal object WeTypeResourceHooks {
     // much lighter background so the white backing circle stays subtle against dark keyboards.
     private const val LOGO_LIGHT_BG_ALPHA_FRACTION = 0.9f
     private const val LOGO_DARK_BG_ALPHA_FRACTION = 0.2f
-    private const val CANDIDATE_SELF_VIEW_CLASS =
-        "com.tencent.wetype.plugin.hld.candidate.selfdraw.selfview.d"
+    private const val CANDIDATE_SELF_VIEW_PACKAGE =
+        "com.tencent.wetype.plugin.hld.candidate.selfdraw.selfview."
     private const val CANDIDATE_WITH_EXTRA_COMPANION_CLASS =
         "com.tencent.wetype.plugin.hld.candidate.b\$a"
-    private const val CANDIDATE_ITEM_ROOT_CLASS =
-        "com.tencent.wetype.plugin.hld.candidate.selfdraw.scrollview.SelfDrawScrollView\$f"
-    private const val CANDIDATE_PINYIN_CONTAINER_ACCESSOR_CLASS =
-        "com.tencent.wetype.plugin.hld.candidate.ImeCandidateView\$d2"
+    private const val CANDIDATE_SCROLL_VIEW_CLASS =
+        "com.tencent.wetype.plugin.hld.candidate.selfdraw.scrollview.SelfDrawScrollView"
+    private const val CANDIDATE_VIEW_CLASS =
+        "com.tencent.wetype.plugin.hld.candidate.ImeCandidateView"
+    private const val CANDIDATE_PINYIN_CONTAINER_ID_NAME = "strike_container_rl"
     private val SETTING_OPAQUE_BACKGROUND_VIEW_CLASSES = listOf(
         "com.tencent.wetype.plugin.hld.view.settingkeyboard.S10SettingKeyboardTypeView",
         "com.tencent.wetype.plugin.hld.view.settingkeyboard.S10SettingCustomToolbarView"
@@ -75,6 +80,12 @@ internal object WeTypeResourceHooks {
     private val candidateItemRootBaseLeftPaddingPx = Collections.synchronizedMap(
         WeakHashMap<Any, Int>()
     )
+    private val candidateItemRootAppliedLeftPaddingPx = Collections.synchronizedMap(
+        WeakHashMap<Any, Int>()
+    )
+    private val candidateMarginInsetWriteDepth = object : ThreadLocal<Int>() {
+        override fun initialValue(): Int = 0
+    }
     private val appearanceColorParamsLock = Any()
     private val hsvScratchThreadLocal = object : ThreadLocal<FloatArray>() {
         override fun initialValue(): FloatArray = FloatArray(3)
@@ -551,24 +562,28 @@ internal object WeTypeResourceHooks {
 
     fun hookCandidateBackgroundCorner() {
         runCatching {
-            val candidateViewClass = loadClassOrNull(CANDIDATE_SELF_VIEW_CLASS)
-                ?: error("Failed to load candidate self view")
-            val cornerField = generateSequence(candidateViewClass as Class<*>?) { it.superclass }
-                .mapNotNull { clazz ->
-                    runCatching { clazz.getDeclaredField("g") }.getOrNull()
+            val candidateViewClass = resolveCandidateSelfViewBaseClass()
+            val cornerSetter = resolveKotlinPropertySetter(
+                owner = candidateViewClass,
+                propertyName = "cornerSize"
+            )
+            if (cornerSetter != null) {
+                cornerSetter.hookBefore { param ->
+                    param.args[0] = WeTypeSettings.getCandidateBackgroundCornerXposed().roundToInt()
                 }
-                .firstOrNull()
-                ?.also { it.isAccessible = true }
-                ?: error("Failed to find candidate corner field g")
-
-            candidateViewClass.declaredMethods
-                .filter { it.name == "e" && it.parameterTypes.size == 3 }
-                .forEach { method ->
-                    method.hookBefore { param ->
-                        val radius = WeTypeSettings.getCandidateBackgroundCornerXposed().roundToInt()
-                        cornerField.setInt(param.thisObject, radius)
-                    }
+            } else {
+                // WeType 3.4 and earlier stripped Kotlin metadata. Keep the old field as a narrow
+                // compatibility fallback, while locating the draw call by its stable signature.
+                val legacyCornerField = candidateViewClass.getDeclaredField("g").also {
+                    it.isAccessible = true
                 }
+                resolveCandidateBackgroundDrawMethod(candidateViewClass).hookBefore { param ->
+                    legacyCornerField.setInt(
+                        param.thisObject,
+                        WeTypeSettings.getCandidateBackgroundCornerXposed().roundToInt()
+                    )
+                }
+            }
             Log.i("Success: Hook candidate background corner")
         }.onFailure {
             Log.i("Failed: Hook candidate background corner")
@@ -578,15 +593,14 @@ internal object WeTypeResourceHooks {
 
     fun hookCandidateBackgroundAlpha() {
         runCatching {
-            val candidateViewClass = loadClassOrNull(CANDIDATE_SELF_VIEW_CLASS)
-                ?: error("Failed to load candidate self view")
+            val candidateViewClass = resolveCandidateSelfViewBaseClass()
             val colorMethods = candidateViewClass.declaredMethods.filter { method ->
-                method.name == "g" &&
+                Modifier.isPrivate(method.modifiers) &&
                     method.parameterTypes.isEmpty() &&
                     method.returnType == Int::class.javaPrimitiveType
             }
             check(colorMethods.isNotEmpty()) {
-                "Failed to find candidate background color method g"
+                "Failed to find candidate background color resolver"
             }
             colorMethods.forEach { method ->
                 method.hookAfter { param ->
@@ -607,34 +621,77 @@ internal object WeTypeResourceHooks {
 
     fun hookCandidateBackgroundLeftMargin() {
         runCatching {
-            val candidateItemRootClass = loadClassOrNull(CANDIDATE_ITEM_ROOT_CLASS)
-                ?: error("Failed to load candidate item root view")
-            val setInsetMethod = candidateItemRootClass.getMethod(
-                "b0",
-                Integer::class.java,
-                Integer::class.java,
-                Integer::class.java,
-                Integer::class.java
-            )
-            candidateItemRootClass.getMethod("N").hookBefore { param ->
-                val itemRoot = param.thisObject ?: return@hookBefore
-                val baseLeftPaddingPx = candidateItemRootBaseLeftPaddingPx.getOrPut(itemRoot) {
-                    runCatching { itemRoot.invokeMethodAs<Int>("p") }.getOrDefault(0)
+            val scrollViewClass = loadClassOrNull(CANDIDATE_SCROLL_VIEW_CLASS)
+                ?: error("Failed to load candidate scroll view")
+            val candidateItemRootClass = resolveCandidateItemRootClass(scrollViewClass)
+            val setInsetMethod = candidateItemRootClass.findMethodInHierarchy {
+                parameterTypes.contentEquals(
+                    arrayOf(
+                        Int::class.javaObjectType,
+                        Int::class.javaObjectType,
+                        Int::class.javaObjectType,
+                        Int::class.javaObjectType
+                    )
+                ) && returnType == Void.TYPE
+            }
+            val positionMethod = candidateItemRootClass.findMethod {
+                parameterTypes.isEmpty() && returnType == Int::class.javaPrimitiveType
+            }
+            val contextMethod = candidateItemRootClass.findMethodInHierarchy {
+                parameterTypes.isEmpty() && returnType == Context::class.java
+            }
+            val holderClass = candidateItemRootClass.declaredFields
+                .map { it.type }
+                .firstOrNull { it.enclosingClass == scrollViewClass }
+                ?: error("Failed to resolve candidate holder class")
+            val holderItemRootMethod = holderClass.findMethod {
+                parameterTypes.isEmpty() && candidateItemRootClass.isAssignableFrom(returnType)
+            }
+            val bindMethod = scrollViewClass.declaredClasses
+                .asSequence()
+                .flatMap { it.declaredMethods.asSequence() }
+                .firstOrNull { method ->
+                    !Modifier.isAbstract(method.modifiers) &&
+                        method.returnType == Void.TYPE &&
+                        method.parameterTypes.contentEquals(
+                            arrayOf(holderClass, Int::class.javaPrimitiveType)
+                        )
                 }
-                val itemPosition = runCatching {
-                    itemRoot.invokeMethodAs<Int>("o0")
-                }.getOrNull() ?: return@hookBefore
-                val targetLeftPaddingPx =
-                    baseLeftPaddingPx + if (itemPosition == 0) {
-                        resolveCandidateBackgroundLeftMarginPx(itemRoot)
-                    } else {
-                        0
-                    }
-                val currentLeftPaddingPx = runCatching {
-                    itemRoot.invokeMethodAs<Int>("p")
-                }.getOrNull() ?: return@hookBefore
-                if (currentLeftPaddingPx == targetLeftPaddingPx) return@hookBefore
-                setInsetMethod.invoke(itemRoot, targetLeftPaddingPx, null, null, null)
+                ?.also { it.isAccessible = true }
+                ?: error("Failed to resolve candidate holder bind method")
+
+            setInsetMethod.hookBefore { param ->
+                if (candidateMarginInsetWriteDepth.get() != 0) return@hookBefore
+                val itemRoot = param.thisObject ?: return@hookBefore
+                if (!candidateItemRootClass.isInstance(itemRoot)) return@hookBefore
+                val leftPadding = param.args[0] as? Int ?: return@hookBefore
+                candidateItemRootBaseLeftPaddingPx[itemRoot] = leftPadding
+                candidateItemRootAppliedLeftPaddingPx.remove(itemRoot)
+            }
+            setInsetMethod.hookAfter { param ->
+                if (candidateMarginInsetWriteDepth.get() != 0) return@hookAfter
+                val itemRoot = param.thisObject ?: return@hookAfter
+                if (!candidateItemRootClass.isInstance(itemRoot)) return@hookAfter
+                val position = runCatching { positionMethod.invoke(itemRoot) as Int }.getOrNull()
+                    ?: return@hookAfter
+                applyCandidateBackgroundLeftMargin(
+                    itemRoot = itemRoot,
+                    position = position,
+                    setInsetMethod = setInsetMethod,
+                    contextMethod = contextMethod
+                )
+            }
+            bindMethod.hookAfter { param ->
+                val holder = param.args[0] ?: return@hookAfter
+                val position = param.args[1] as? Int ?: return@hookAfter
+                val itemRoot = runCatching { holderItemRootMethod.invoke(holder) }.getOrNull()
+                    ?: return@hookAfter
+                applyCandidateBackgroundLeftMargin(
+                    itemRoot = itemRoot,
+                    position = position,
+                    setInsetMethod = setInsetMethod,
+                    contextMethod = contextMethod
+                )
             }
             Log.i("Success: Hook candidate background left margin")
         }.onFailure {
@@ -645,10 +702,15 @@ internal object WeTypeResourceHooks {
 
     fun hookCandidatePinyinLeftMargin() {
         runCatching {
-            val candidateContainerAccessorClass = loadClassOrNull(CANDIDATE_PINYIN_CONTAINER_ACCESSOR_CLASS)
-                ?: error("Failed to load ImeCandidateView\$d2")
-            candidateContainerAccessorClass.getMethod("invoke").hookAfter { param ->
-                val container = param.result as? FrameLayout ?: return@hookAfter
+            val candidateViewClass = loadClassOrNull(CANDIDATE_VIEW_CLASS)
+                ?: error("Failed to load ImeCandidateView")
+            val containerId = loadClassOrNull(WETYPE_ID_R_CLASS)
+                ?.getField(CANDIDATE_PINYIN_CONTAINER_ID_NAME)
+                ?.getInt(null)
+                ?: error("Failed to resolve $CANDIDATE_PINYIN_CONTAINER_ID_NAME")
+            candidateViewClass.getDeclaredMethod("onAttachedToWindow").hookAfter { param ->
+                val candidateView = param.thisObject as? View ?: return@hookAfter
+                val container = candidateView.findViewById<View>(containerId) ?: return@hookAfter
                 applyCandidatePinyinLeftMargin(container)
                 ensureCandidatePinyinMarginSync(container)
             }
@@ -816,6 +878,101 @@ internal object WeTypeResourceHooks {
         }
     }
 
+    private fun resolveCandidateItemRootClass(scrollViewClass: Class<*>): Class<*> =
+        scrollViewClass.declaredClasses.firstOrNull { nestedClass ->
+            nestedClass.superclass?.name?.startsWith(CANDIDATE_SELF_VIEW_PACKAGE) == true &&
+                nestedClass.declaredConstructors.any { constructor ->
+                    constructor.parameterTypes.contentEquals(arrayOf(Context::class.java))
+                } &&
+                nestedClass.declaredFields.any { field ->
+                    field.type.enclosingClass == scrollViewClass
+                }
+        } ?: error("Failed to resolve candidate item root class")
+
+    private fun resolveCandidateSelfViewBaseClass(): Class<*> {
+        val scrollViewClass = loadClassOrNull(CANDIDATE_SCROLL_VIEW_CLASS)
+            ?: error("Failed to load candidate scroll view")
+        val itemRootClass = resolveCandidateItemRootClass(scrollViewClass)
+        return generateSequence(itemRootClass as Class<*>?) { it.superclass }
+            .firstOrNull { candidateClass ->
+                candidateClass.name.startsWith(CANDIDATE_SELF_VIEW_PACKAGE) &&
+                    runCatching { resolveCandidateBackgroundDrawMethod(candidateClass) }.isSuccess
+            }
+            ?: error("Failed to resolve candidate self view base class")
+    }
+
+    private fun resolveCandidateBackgroundDrawMethod(owner: Class<*>): Method = owner.findMethod {
+        Modifier.isPrivate(modifiers) &&
+            returnType == Void.TYPE &&
+            parameterTypes.size == 3 &&
+            parameterTypes[0] == Context::class.java &&
+            parameterTypes[1] == Canvas::class.java &&
+            parameterTypes[2] == Rect::class.java
+    }
+
+    private fun resolveKotlinPropertySetter(
+        owner: Class<*>,
+        propertyName: String
+    ): Method? {
+        owner.declaredMethods.firstOrNull { method ->
+            method.name == "set${propertyName.replaceFirstChar { it.uppercase() }}" &&
+                method.returnType == Void.TYPE &&
+                method.parameterTypes.contentEquals(arrayOf(Int::class.javaPrimitiveType))
+        }?.let { method ->
+            method.isAccessible = true
+            return method
+        }
+
+        val metadata = owner.declaredAnnotations.firstOrNull { annotation ->
+            annotation.annotationClass.java.name == "kotlin.Metadata"
+        } ?: return null
+        val data2 = runCatching {
+            @Suppress("UNCHECKED_CAST")
+            metadata.annotationClass.java.getMethod("d2").invoke(metadata) as Array<String>
+        }.getOrNull() ?: return null
+        val propertyIndex = data2.indexOf(propertyName)
+        if (propertyIndex < 0) return null
+
+        return (propertyIndex - 1 downTo maxOf(0, propertyIndex - 4))
+            .asSequence()
+            .map { data2[it] }
+            .flatMap { methodName ->
+                owner.declaredMethods.asSequence().filter { method ->
+                    method.name == methodName &&
+                        method.returnType == Void.TYPE &&
+                        method.parameterTypes.contentEquals(arrayOf(Int::class.javaPrimitiveType))
+                }
+            }
+            .firstOrNull()
+            ?.also { it.isAccessible = true }
+    }
+
+    private fun applyCandidateBackgroundLeftMargin(
+        itemRoot: Any,
+        position: Int,
+        setInsetMethod: Method,
+        contextMethod: Method
+    ) {
+        if (position < 0) return
+        val baseLeftPaddingPx = candidateItemRootBaseLeftPaddingPx[itemRoot] ?: 0
+        val context = runCatching { contextMethod.invoke(itemRoot) as? Context }.getOrNull()
+            ?: return
+        val targetLeftPaddingPx = baseLeftPaddingPx + if (position == 0) {
+            resolveCandidateBackgroundLeftMarginPx(context)
+        } else {
+            0
+        }
+        if (candidateItemRootAppliedLeftPaddingPx[itemRoot] == targetLeftPaddingPx) return
+
+        candidateMarginInsetWriteDepth.set((candidateMarginInsetWriteDepth.get() ?: 0) + 1)
+        try {
+            setInsetMethod.invoke(itemRoot, targetLeftPaddingPx, null, null, null)
+            candidateItemRootAppliedLeftPaddingPx[itemRoot] = targetLeftPaddingPx
+        } finally {
+            candidateMarginInsetWriteDepth.set((candidateMarginInsetWriteDepth.get() ?: 1) - 1)
+        }
+    }
+
     private fun ensureCandidatePinyinMarginSync(view: View) {
         if (candidatePinyinMarginListeners.containsKey(view)) return
         val layoutListener = View.OnLayoutChangeListener { changedView, _, _, _, _, _, _, _, _ ->
@@ -851,10 +1008,7 @@ internal object WeTypeResourceHooks {
         )
     }
 
-    private fun resolveCandidateBackgroundLeftMarginPx(itemRoot: Any): Int {
-        val context = runCatching {
-            itemRoot.invokeMethodAs<Context>("k")
-        }.getOrNull() ?: return 0
+    private fun resolveCandidateBackgroundLeftMarginPx(context: Context): Int {
         return TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP,
             WeTypeSettings.getCandidateBackgroundLeftMarginDpXposed().toFloat(),
