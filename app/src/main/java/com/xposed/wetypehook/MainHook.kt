@@ -7,7 +7,10 @@ import android.content.res.Resources
 import android.graphics.Color
 import android.inputmethodservice.InputMethodService
 import android.provider.Settings
+import android.view.LayoutInflater
 import android.view.View
+import android.view.ViewGroup
+import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
 import com.xposed.wetypehook.wetype.hook.WeTypeResourceHooks
 import com.xposed.wetypehook.wetype.hook.WeTypeUpdateHooks
@@ -33,6 +36,10 @@ import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Field
 import java.lang.reflect.Method
+import java.lang.reflect.Modifier
+import java.lang.ref.WeakReference
+import java.util.Collections
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG = "miuiime"
@@ -69,6 +76,14 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         "com.xiaomi.type"
     )
     private val installedHookTokens = ConcurrentHashMap.newKeySet<String>()
+    private val monitoredImeInputFrames = Collections.newSetFromMap(WeakHashMap<ViewGroup, Boolean>())
+    private val originalImeContentBottomPaddings = WeakHashMap<View, Int>()
+    private val originalFullscreenAreaHeights = WeakHashMap<ViewGroup, IntArray>()
+    private val adjustedImeContentViews = WeakHashMap<ViewGroup, WeakReference<View>>()
+    private val miuiBottomFrameViews = WeakHashMap<
+        ViewGroup,
+        Triple<WeakReference<ViewGroup>, WeakReference<View>, WeakReference<View>>
+    >()
     private var navBarColor: Int? = null
     private var bottomViewSourceColor: Int? = null
     private lateinit var modulePath: String
@@ -202,8 +217,209 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         if (isNonCustomize) {
             hookSIsImeSupport(bottomManagerClass)
             hookIsXiaoAiEnable(bottomManagerClass)
+            hookMiuiBottomInsetCompatibility(bottomManagerClass)
         }
         hookSupportImeList(bottomManagerClass)
+    }
+
+    private fun hookMiuiBottomInsetCompatibility(clazz: Class<*>) {
+        val token = classHookToken("miuiBottomInsetCompatibility", clazz)
+        if (!installedHookTokens.add(token)) return
+
+        val hookInstalled = runCatching {
+            clazz.findMethod {
+                name == "addMiuiBottomView" &&
+                    Modifier.isStatic(modifiers) &&
+                    parameterTypes.size >= 6 &&
+                    Context::class.java.isAssignableFrom(parameterTypes[0]) &&
+                    LayoutInflater::class.java.isAssignableFrom(parameterTypes[1]) &&
+                    ViewGroup::class.java.isAssignableFrom(parameterTypes[2]) &&
+                    ViewGroup::class.java.isAssignableFrom(parameterTypes[3]) &&
+                    View::class.java.isAssignableFrom(parameterTypes[4]) &&
+                    View::class.java.isAssignableFrom(parameterTypes[5])
+            }.hookAfter { param ->
+                val fullscreenArea = param.args.getOrNull(2) as? ViewGroup ?: return@hookAfter
+                val inputFrame = param.args.getOrNull(3) as? ViewGroup ?: return@hookAfter
+                val rootView = param.args.getOrNull(4) as? View ?: return@hookAfter
+                val bottomArea = param.args.getOrNull(5) as? View ?: return@hookAfter
+                registerMiuiBottomFrame(fullscreenArea, inputFrame, rootView, bottomArea)
+            }
+            true
+        }.onFailure {
+            installedHookTokens.remove(token)
+            Log.i("Failed:Hook MIUI bottom inset compatibility")
+            Log.i(it)
+        }.getOrDefault(false)
+        if (!hookInstalled) return
+
+        clazz.declaredMethods
+            .filter { it.name == "onWindowShown" || it.name == "changeViewForMiuiBottom" }
+            .forEach { method ->
+                runCatching {
+                    method.isAccessible = true
+                    method.hookAfter {
+                        reconcileCurrentImeFrame(clazz)
+                    }
+                }.onFailure {
+                    Log.i("Failed:Hook MIUI bottom inset lifecycle method ${method.name}")
+                    Log.i(it)
+                }
+            }
+    }
+
+    private fun registerMiuiBottomFrame(
+        fullscreenArea: ViewGroup,
+        inputFrame: ViewGroup,
+        rootView: View,
+        bottomArea: View
+    ) {
+        miuiBottomFrameViews[inputFrame] = Triple(
+            WeakReference(fullscreenArea),
+            WeakReference(rootView),
+            WeakReference(bottomArea)
+        )
+        if (monitoredImeInputFrames.add(inputFrame)) {
+            inputFrame.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                reconcileMiuiBottomFrame(inputFrame)
+            }
+        }
+        inputFrame.post { reconcileMiuiBottomFrame(inputFrame) }
+    }
+
+    private fun reconcileCurrentImeFrame(clazz: Class<*>) {
+        val currentInputFrame = runCatching {
+            clazz.getStaticObject("sBottomViewHelper")
+                ?.getObjectAs<ViewGroup>("mInputFrame")
+        }.getOrNull()
+        val inputFrames = currentInputFrame?.let(::listOf)
+            ?: miuiBottomFrameViews.keys.toList()
+        inputFrames.forEach { inputFrame ->
+            inputFrame.post { reconcileMiuiBottomFrame(inputFrame) }
+            inputFrame.postDelayed({ reconcileMiuiBottomFrame(inputFrame) }, 100L)
+        }
+    }
+
+    private fun reconcileMiuiBottomFrame(inputFrame: ViewGroup) {
+        val frameViews = miuiBottomFrameViews[inputFrame] ?: return
+        val fullscreenArea = frameViews.first.get() ?: return
+        val rootView = frameViews.second.get() ?: return
+        val bottomArea = frameViews.third.get() ?: return
+        val contentView = (0 until inputFrame.childCount)
+            .firstNotNullOfOrNull { index ->
+                inputFrame.getChildAt(index).takeIf { it.visibility == View.VISIBLE }
+            }
+        val navigationInset = rootView.rootWindowInsets
+            ?.getInsets(WindowInsets.Type.navigationBars())
+            ?.bottom
+
+        if (navigationInset == null || navigationInset <= 0 ||
+            !isBottomAreaActive(rootView, inputFrame, bottomArea, navigationInset)
+        ) {
+            restoreMiuiBottomFrame(inputFrame, fullscreenArea)
+            return
+        }
+        if (contentView == null) {
+            restoreMiuiBottomFrame(inputFrame, fullscreenArea)
+            return
+        }
+        val adjustedContentReference = adjustedImeContentViews[inputFrame]
+        val adjustedContentView = adjustedContentReference?.get()
+        if (adjustedContentReference != null && adjustedContentView !== contentView) {
+            restoreMiuiBottomFrame(inputFrame, fullscreenArea)
+        }
+
+        val originalPadding = originalImeContentBottomPaddings[contentView]
+        val isCurrentContentAdjusted = adjustedImeContentViews[inputFrame]?.get() === contentView
+        val isAlreadyAdjusted = isCurrentContentAdjusted &&
+            originalPadding == navigationInset &&
+            contentView.paddingBottom == 0
+        val fillsInputFrame = inputFrame.paddingBottom == 0 &&
+            contentView.top == inputFrame.paddingTop &&
+            contentView.bottom == inputFrame.height
+        if (!fillsInputFrame ||
+            contentView.paddingBottom != navigationInset && !isAlreadyAdjusted
+        ) {
+            if (isCurrentContentAdjusted) restoreMiuiBottomFrame(inputFrame, fullscreenArea)
+            return
+        }
+
+        originalImeContentBottomPaddings.putIfAbsent(contentView, contentView.paddingBottom)
+        if (!isAlreadyAdjusted) {
+            contentView.setPadding(
+                contentView.paddingLeft,
+                contentView.paddingTop,
+                contentView.paddingRight,
+                contentView.paddingBottom - navigationInset
+            )
+        }
+        adjustedImeContentViews[inputFrame] = WeakReference(contentView)
+        if (!expandFullscreenArea(fullscreenArea, navigationInset)) {
+            restoreMiuiBottomFrame(inputFrame, fullscreenArea)
+        }
+    }
+
+    private fun expandFullscreenArea(fullscreenArea: ViewGroup, navigationInset: Int): Boolean {
+        val params = fullscreenArea.layoutParams ?: return false
+        val previous = originalFullscreenAreaHeights[fullscreenArea]
+        val currentHeight = params.height
+        val baseHeight = when {
+            previous == null -> currentHeight
+            currentHeight == previous[2] && navigationInset == previous[1] -> return true
+            currentHeight == previous[2] || currentHeight == previous[0] -> previous[0]
+            else -> currentHeight
+        }
+        val targetHeight = if (baseHeight >= 0) {
+            baseHeight + navigationInset
+        } else {
+            fullscreenArea.measuredHeight.takeIf { it > 0 }?.plus(navigationInset) ?: return false
+        }
+        originalFullscreenAreaHeights[fullscreenArea] = intArrayOf(
+            baseHeight,
+            navigationInset,
+            targetHeight
+        )
+        if (currentHeight != targetHeight) {
+            params.height = targetHeight
+            fullscreenArea.layoutParams = params
+        }
+        return true
+    }
+
+    private fun restoreMiuiBottomFrame(inputFrame: ViewGroup, fullscreenArea: ViewGroup) {
+        adjustedImeContentViews.remove(inputFrame)?.get()?.let { view ->
+            val paddingBottom = originalImeContentBottomPaddings.remove(view)
+            if (paddingBottom != null && view.paddingBottom == 0) {
+                view.setPadding(
+                    view.paddingLeft,
+                    view.paddingTop,
+                    view.paddingRight,
+                    paddingBottom
+                )
+            }
+        }
+        val height = originalFullscreenAreaHeights.remove(fullscreenArea) ?: return
+        val params = fullscreenArea.layoutParams ?: return
+        if (params.height == height[2]) {
+            params.height = height[0]
+            fullscreenArea.layoutParams = params
+        }
+    }
+
+    private fun isBottomAreaActive(
+        rootView: View,
+        inputFrame: View,
+        bottomArea: View,
+        navigationInset: Int
+    ): Boolean {
+        if (!bottomArea.isShown || bottomArea.height < navigationInset) return false
+        val rootLocation = IntArray(2)
+        val inputLocation = IntArray(2)
+        val bottomLocation = IntArray(2)
+        rootView.getLocationOnScreen(rootLocation)
+        inputFrame.getLocationOnScreen(inputLocation)
+        bottomArea.getLocationOnScreen(bottomLocation)
+        return bottomLocation[1] + bottomArea.height == rootLocation[1] + rootView.height &&
+            inputLocation[1] + inputFrame.height == bottomLocation[1]
     }
 
     private fun hookSupportImeList(clazz: Class<*>) {
