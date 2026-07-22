@@ -371,7 +371,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         val targetHeight = if (baseHeight >= 0) {
             baseHeight + navigationInset
         } else {
-            fullscreenArea.measuredHeight.takeIf { it > 0 }?.plus(navigationInset) ?: return false
+            fullscreenArea.measuredHeight + navigationInset
         }
         originalFullscreenAreaHeights[fullscreenArea] = intArrayOf(
             baseHeight,
