@@ -56,8 +56,6 @@ internal object WeTypeResourceHooks {
     private const val LOGO_DARK_BG_ALPHA_FRACTION = 0.2f
     private const val CANDIDATE_SELF_VIEW_PACKAGE =
         "com.tencent.wetype.plugin.hld.candidate.selfdraw.selfview."
-    private const val CANDIDATE_WITH_EXTRA_COMPANION_CLASS =
-        "com.tencent.wetype.plugin.hld.candidate.b\$a"
     private const val CANDIDATE_SCROLL_VIEW_CLASS =
         "com.tencent.wetype.plugin.hld.candidate.selfdraw.scrollview.SelfDrawScrollView"
     private const val CANDIDATE_VIEW_CLASS =
@@ -542,15 +540,7 @@ internal object WeTypeResourceHooks {
 
     fun hookCandidateSpecialTextColor() {
         runCatching {
-            val candidateWithExtraCompanionClass =
-                loadClassOrNull(CANDIDATE_WITH_EXTRA_COMPANION_CLASS)
-                    ?: error("Failed to load CandidateWithExtra companion")
-            candidateWithExtraCompanionClass.findMethod {
-                name == "s" &&
-                    parameterTypes.size == 1 &&
-                    parameterTypes[0] == Int::class.javaPrimitiveType &&
-                    returnType == Int::class.javaPrimitiveType
-            }.hookAfter { param ->
+            resolveCandidateSpecialTextColorMethod().hookAfter { param ->
                 param.result = WeTypeSettings.getAppearanceColorXposed("theme_color")
             }
             Log.i("Success: Hook candidate special text color")
@@ -888,6 +878,50 @@ internal object WeTypeResourceHooks {
                     field.type.enclosingClass == scrollViewClass
                 }
         } ?: error("Failed to resolve candidate item root class")
+
+    private fun resolveCandidateSpecialTextColorMethod(): Method {
+        val candidateViewClass = loadClassOrNull(CANDIDATE_VIEW_CLASS)
+            ?: error("Failed to load ImeCandidateView")
+        val candidateClass = candidateViewClass.declaredMethods
+            .asSequence()
+            .map { it.returnType }
+            .distinct()
+            .firstOrNull { returnType ->
+                returnType.superclass?.name == "com.tencent.wxhld.info.Candidate" &&
+                    resolveCandidateColorCompanionMethod(returnType) != null
+            }
+            ?: error("Failed to resolve CandidateWithExtra")
+        return resolveCandidateColorCompanionMethod(candidateClass)
+            ?: error("Failed to resolve CandidateWithExtra color method")
+    }
+
+    private fun resolveCandidateColorCompanionMethod(candidateClass: Class<*>): Method? {
+        val staticHolderTypes = candidateClass.declaredFields
+            .asSequence()
+            .filter { Modifier.isStatic(it.modifiers) }
+            .map { it.type }
+            .toSet()
+        return candidateClass.declaredClasses
+            .asSequence()
+            .filter { it in staticHolderTypes }
+            .firstNotNullOfOrNull { nestedClass ->
+                val colorMethods = nestedClass.declaredMethods.filter { method ->
+                    !Modifier.isStatic(method.modifiers) &&
+                        method.returnType == Int::class.javaPrimitiveType &&
+                        method.parameterTypes.contentEquals(
+                            arrayOf(Int::class.javaPrimitiveType)
+                        )
+                }
+                val noArgColorMethodCount = nestedClass.declaredMethods.count { method ->
+                    !Modifier.isStatic(method.modifiers) &&
+                        method.returnType == Int::class.javaPrimitiveType &&
+                        method.parameterTypes.isEmpty()
+                }
+                colorMethods.singleOrNull()
+                    ?.takeIf { noArgColorMethodCount >= 2 }
+                    ?.also { it.isAccessible = true }
+            }
+    }
 
     private fun resolveCandidateSelfViewBaseClass(): Class<*> {
         val scrollViewClass = loadClassOrNull(CANDIDATE_SCROLL_VIEW_CLASS)
