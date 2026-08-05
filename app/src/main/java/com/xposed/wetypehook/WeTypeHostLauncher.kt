@@ -12,10 +12,15 @@ import android.view.ContextThemeWrapper
 import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentDialog
 import androidx.compose.ui.platform.ComposeView
+import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import com.xposed.wetypehook.xposed.Log
 import java.util.WeakHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 private const val MODULE_PACKAGE_NAME = "com.xposed.wetypehook"
 private val activeHostDialogs = WeakHashMap<Activity, ComponentDialog>()
@@ -24,6 +29,9 @@ private val moduleResourcesCache = HashMap<String, Resources>()
 object WeTypeHostLauncher {
     fun show(activity: Activity) {
         activeHostDialogs[activity]?.takeIf { it.isShowing }?.let { return }
+        WeTypeSettings.bindModuleBridgePendingIntent(
+            ModuleBridgeContract.settingsBridgePendingIntent(activity.intent)
+        )
 
         val moduleContext = runCatching {
             activity.createPackageContext(
@@ -43,7 +51,10 @@ object WeTypeHostLauncher {
         ).apply {
             requestWindowFeature(Window.FEATURE_NO_TITLE)
             setCanceledOnTouchOutside(false)
-            setOnDismissListener { activeHostDialogs.remove(activity) }
+            setOnDismissListener {
+                activeHostDialogs.remove(activity)
+                WeTypeSettings.bindModuleBridgePendingIntent(null)
+            }
         }
         activeHostDialogs[activity] = dialog
         val windowBackgroundColor = resolveWindowBackgroundColor(dialog.context)
@@ -74,6 +85,25 @@ object WeTypeHostLauncher {
             navigationBarColor = windowBackgroundColor
             setBackgroundDrawable(ColorDrawable(windowBackgroundColor))
         }
+    }
+
+    fun prepareForHotReload(): Boolean {
+        val cleaned = runOnMainThreadBlocking {
+            val dialogs = synchronized(activeHostDialogs) {
+                activeHostDialogs.values.toList().also { activeHostDialogs.clear() }
+            }
+            dialogs.forEach { dialog ->
+                dialog.setOnDismissListener(null)
+                if (dialog.isShowing) dialog.dismiss()
+            }
+        }
+        if (cleaned) {
+            WeTypeSettings.bindModuleBridgePendingIntent(null)
+            synchronized(moduleResourcesCache) {
+                moduleResourcesCache.clear()
+            }
+        }
+        return cleaned
     }
 
     private fun createEmbeddedModuleContext(activity: Activity): Context? {
@@ -107,6 +137,36 @@ object WeTypeHostLauncher {
         }
         return EmbeddedModuleContext(activity, moduleResources)
     }
+}
+
+private fun runOnMainThreadBlocking(block: () -> Unit): Boolean {
+    if (Looper.myLooper() == Looper.getMainLooper()) {
+        return runCatching(block).onFailure {
+            Log.e("Failed:Cleanup WeType host dialog for hot reload")
+            Log.i(it)
+        }.isSuccess
+    }
+
+    val completed = CountDownLatch(1)
+    var failure: Throwable? = null
+    if (!Handler(Looper.getMainLooper()).post {
+            try {
+                block()
+            } catch (error: Throwable) {
+                failure = error
+            } finally {
+                completed.countDown()
+            }
+        }
+    ) {
+        return false
+    }
+    val finished = runCatching { completed.await(2, TimeUnit.SECONDS) }.getOrDefault(false)
+    failure?.let {
+        Log.e("Failed:Cleanup WeType host dialog for hot reload")
+        Log.i(it)
+    }
+    return finished && failure == null
 }
 
 private fun resolveWindowBackgroundColor(context: Context): Int {

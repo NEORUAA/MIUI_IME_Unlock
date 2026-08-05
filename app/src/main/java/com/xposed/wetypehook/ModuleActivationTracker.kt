@@ -1,10 +1,9 @@
 package com.xposed.wetypehook
 
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
 import android.content.SharedPreferences
 import android.os.SystemClock
+import io.github.libxposed.service.HookedTarget
 
 object ModuleActivationTracker {
     private const val MODULE_PACKAGE_NAME = "com.xposed.wetypehook"
@@ -13,7 +12,6 @@ object ModuleActivationTracker {
     private const val KEY_LAST_SOURCE_PACKAGE = "last_source_package"
     private const val KEY_LAST_SOURCE_PROCESS = "last_source_process"
 
-    const val ACTION_RECORD_ACTIVATION = "$MODULE_PACKAGE_NAME.action.RECORD_ACTIVATION"
     const val EXTRA_SOURCE_PACKAGE = "source_package"
     const val EXTRA_SOURCE_PROCESS = "source_process"
 
@@ -23,7 +21,10 @@ object ModuleActivationTracker {
         "com.iflytek.inputmethod.miui",
         "com.sohu.inputmethod.sogou.xiaomi",
         "com.baidu.input_mi",
-        "com.miui.catcherpatch"
+        "com.miui.catcherpatch",
+        "com.google.android.inputmethod.latin",
+        "com.miui.phrase",
+        "com.xiaomi.type"
     )
 
     data class ActivationStatus(
@@ -62,11 +63,15 @@ object ModuleActivationTracker {
         sourceProcess: String?
     ) {
         val appContext = context.applicationContext ?: context
-        val intent = Intent(ACTION_RECORD_ACTIVATION)
-            .setClassName(MODULE_PACKAGE_NAME, ModuleActivationReceiver::class.java.name)
+        if (sourcePackage !in trustedSourcePackages) return
+        val intent = ModuleBridgeContract.explicitBridgeIntent()
+            .putExtra(
+                ModuleBridgeContract.EXTRA_MESSAGE_TYPE,
+                ModuleBridgeContract.MESSAGE_RECORD_ACTIVATION
+            )
             .putExtra(EXTRA_SOURCE_PACKAGE, sourcePackage)
             .putExtra(EXTRA_SOURCE_PROCESS, sourceProcess)
-        runCatching { appContext.sendBroadcast(intent) }
+        ModuleBridgeContract.sendWithIdentity(appContext, intent)
     }
 
     fun readStatus(context: Context): ActivationStatus {
@@ -110,14 +115,34 @@ object ModuleActivationTracker {
         context: Context,
         sourcePackage: String,
         sourceProcess: String?
-    ) {
-        if (sourcePackage !in trustedSourcePackages) return
-        preferences(context)
+    ): Boolean {
+        if (sourcePackage !in trustedSourcePackages) return false
+        return preferences(context)
             .edit()
             .putLong(KEY_LAST_ACTIVATED_AT, System.currentTimeMillis())
             .putString(KEY_LAST_SOURCE_PACKAGE, sourcePackage)
             .putString(KEY_LAST_SOURCE_PROCESS, sourceProcess)
-            .apply()
+            .commit()
+    }
+
+    fun recordRunningTargets(context: Context, targets: List<HookedTarget>) {
+        val target = targets.firstOrNull { target ->
+            target.processName.substringBefore(':') == "com.tencent.wetype"
+        } ?: return
+        val sourcePackage = target.processName
+            .substringBefore(':')
+            .let { packageName ->
+                if (packageName == "system_server" || packageName == "system") {
+                    "android"
+                } else {
+                    packageName
+                }
+            }
+        recordActivation(
+            context = context,
+            sourcePackage = sourcePackage,
+            sourceProcess = target.processName
+        )
     }
 
     private fun preferences(context: Context): SharedPreferences {
@@ -128,17 +153,4 @@ object ModuleActivationTracker {
     private fun resolveProcessName(context: Context): String? = runCatching {
         context.applicationInfo.processName ?: context.packageName
     }.getOrNull()
-}
-
-class ModuleActivationReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != ModuleActivationTracker.ACTION_RECORD_ACTIVATION) return
-        val sourcePackage = intent.getStringExtra(ModuleActivationTracker.EXTRA_SOURCE_PACKAGE)
-            ?: return
-        ModuleActivationTracker.recordActivation(
-            context = context,
-            sourcePackage = sourcePackage,
-            sourceProcess = intent.getStringExtra(ModuleActivationTracker.EXTRA_SOURCE_PROCESS)
-        )
-    }
 }

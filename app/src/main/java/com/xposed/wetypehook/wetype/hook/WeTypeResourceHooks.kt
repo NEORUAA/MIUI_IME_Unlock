@@ -14,9 +14,10 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.View
+import android.view.ViewGroup
+import android.widget.ImageView
+import com.xposed.wetypehook.xposed.HookEnvironment
 import com.xposed.wetypehook.xposed.Log
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedHelpers
 import com.xposed.wetypehook.xposed.findMethod
 import com.xposed.wetypehook.xposed.findMethodInHierarchy
 import com.xposed.wetypehook.xposed.getObjectAs
@@ -54,6 +55,7 @@ internal object WeTypeResourceHooks {
     // much lighter background so the white backing circle stays subtle against dark keyboards.
     private const val LOGO_LIGHT_BG_ALPHA_FRACTION = 0.9f
     private const val LOGO_DARK_BG_ALPHA_FRACTION = 0.2f
+    private const val LOGO_RESOURCE_TAG_KEY = 0x4D49554C
     private const val CANDIDATE_SELF_VIEW_PACKAGE =
         "com.tencent.wetype.plugin.hld.candidate.selfdraw.selfview."
     private const val CANDIDATE_SCROLL_VIEW_CLASS =
@@ -72,9 +74,33 @@ internal object WeTypeResourceHooks {
     private val resourcePackageCache = Collections.synchronizedMap(
         WeakHashMap<Resources, MutableMap<Int, Boolean>>()
     )
-    private val candidatePinyinMarginListeners = Collections.synchronizedMap(
-        WeakHashMap<View, View.OnLayoutChangeListener>()
+    private data class CandidatePinyinListeners(
+        val layout: View.OnLayoutChangeListener,
+        val attach: View.OnAttachStateChangeListener
     )
+
+    private data class ViewPadding(
+        val start: Int,
+        val top: Int,
+        val end: Int,
+        val bottom: Int
+    )
+
+    private val candidatePinyinMarginListeners = Collections.synchronizedMap(
+        WeakHashMap<View, CandidatePinyinListeners>()
+    )
+    private val candidatePinyinOriginalPaddings = Collections.synchronizedMap(
+        WeakHashMap<View, ViewPadding>()
+    )
+    private data class LogoHostState(
+        val resourceId: Int? = null,
+        val drawable: Drawable? = null
+    )
+
+    private val replacedLogoStates = Collections.synchronizedMap(
+        WeakHashMap<ImageView, LogoHostState>()
+    )
+    private val restoringLogoDrawable = ThreadLocal.withInitial { false }
     private val candidateItemRootBaseLeftPaddingPx = Collections.synchronizedMap(
         WeakHashMap<Any, Int>()
     )
@@ -724,48 +750,108 @@ internal object WeTypeResourceHooks {
             // broke the dark-logo detection on 3.4.0 and left the background fully opaque.
             val darkLogoResIds = resolveDarkLogoResIds()
 
-            val replaceLogo = object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val imageView = param.thisObject as? android.widget.ImageView ?: return
-                    if (imageView.id == logoIvId) {
-                        val drawableArg = param.args.getOrNull(0)
-                        if (drawableArg is WeTypeIconDrawable) return
-
-                        var alpha = LOGO_LIGHT_BG_ALPHA_FRACTION
-                        if (param.method.name == "setImageResource") {
-                            val resId = param.args[0] as Int
-                            if (isDarkLogoResource(resId, darkLogoResIds, imageView.resources)) {
-                                alpha = LOGO_DARK_BG_ALPHA_FRACTION
-                            }
-                            imageView.setImageDrawable(WeTypeIconDrawable(alpha))
-                            param.result = null
-                        } else {
-                            val uiMode = imageView.resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK
-                            if (uiMode == android.content.res.Configuration.UI_MODE_NIGHT_YES) {
-                                alpha = LOGO_DARK_BG_ALPHA_FRACTION
-                            }
-                            param.args[0] = WeTypeIconDrawable(alpha)
-                        }
-                    }
-                }
-            }
-
-            XposedHelpers.findAndHookMethod(
-                android.widget.ImageView::class.java,
+            ImageView::class.java.getMethod(
                 "setImageResource",
-                Int::class.javaPrimitiveType,
-                replaceLogo
-            )
-            XposedHelpers.findAndHookMethod(
-                android.widget.ImageView::class.java,
+                Int::class.javaPrimitiveType
+            ).hookBefore { param ->
+                val imageView = param.thisObject as? ImageView ?: return@hookBefore
+                if (imageView.id != logoIvId || restoringLogoDrawable.get() == true) return@hookBefore
+
+                val resId = param.args[0] as? Int ?: return@hookBefore
+                synchronized(replacedLogoStates) {
+                    replacedLogoStates[imageView] = LogoHostState(resourceId = resId)
+                }
+                imageView.setTag(LOGO_RESOURCE_TAG_KEY, resId)
+                val alpha = if (isDarkLogoResource(resId, darkLogoResIds, imageView.resources)) {
+                    LOGO_DARK_BG_ALPHA_FRACTION
+                } else {
+                    LOGO_LIGHT_BG_ALPHA_FRACTION
+                }
+                imageView.setImageDrawable(WeTypeIconDrawable(alpha))
+                param.result = null
+            }
+            ImageView::class.java.getMethod(
                 "setImageDrawable",
-                android.graphics.drawable.Drawable::class.java,
-                replaceLogo
-            )
+                Drawable::class.java
+            ).hookBefore { param ->
+                val imageView = param.thisObject as? ImageView ?: return@hookBefore
+                if (imageView.id != logoIvId || restoringLogoDrawable.get() == true) return@hookBefore
+
+                val drawableArg = param.args.getOrNull(0)
+                if (drawableArg is WeTypeIconDrawable) return@hookBefore
+                synchronized(replacedLogoStates) {
+                    replacedLogoStates[imageView] = LogoHostState(drawable = drawableArg as? Drawable)
+                }
+                imageView.setTag(LOGO_RESOURCE_TAG_KEY, null)
+                var alpha = LOGO_LIGHT_BG_ALPHA_FRACTION
+                val uiMode = imageView.resources.configuration.uiMode and
+                    android.content.res.Configuration.UI_MODE_NIGHT_MASK
+                if (uiMode == android.content.res.Configuration.UI_MODE_NIGHT_YES) {
+                    alpha = LOGO_DARK_BG_ALPHA_FRACTION
+                }
+                param.args[0] = WeTypeIconDrawable(alpha)
+            }
             Log.i("Success: Hook WeType keyboard logo")
         }.onFailure {
             Log.i("Failed: Hook WeType keyboard logo")
             Log.i(it)
+        }
+    }
+
+    fun reconcileCurrentKeyboardLogos(rootViews: Collection<View>) {
+        val logoIvId = runCatching {
+            loadClassOrNull(WETYPE_ID_R_CLASS)?.getField("logo_iv")?.getInt(null)
+        }.getOrNull() ?: return
+        val candidatePinyinContainerId = runCatching {
+            loadClassOrNull(WETYPE_ID_R_CLASS)
+                ?.getField(CANDIDATE_PINYIN_CONTAINER_ID_NAME)
+                ?.getInt(null)
+        }.getOrNull()
+        val darkLogoResIds = resolveDarkLogoResIds()
+        rootViews.forEach { rootView ->
+            forEachView(rootView) { view ->
+                if (view.id == candidatePinyinContainerId) {
+                    applyCandidatePinyinLeftMargin(view)
+                    ensureCandidatePinyinMarginSync(view)
+                }
+                val imageView = view as? ImageView ?: return@forEachView
+                if (imageView.id != logoIvId || imageView.drawable is WeTypeIconDrawable) {
+                    return@forEachView
+                }
+                val resourceId = imageView.getTag(LOGO_RESOURCE_TAG_KEY) as? Int
+                synchronized(replacedLogoStates) {
+                    replacedLogoStates[imageView] = if (resourceId != null) {
+                        LogoHostState(resourceId = resourceId)
+                    } else {
+                        LogoHostState(drawable = imageView.drawable)
+                    }
+                }
+                val isDark = resourceId?.let { resId ->
+                    isDarkLogoResource(resId, darkLogoResIds, imageView.resources)
+                } ?: (
+                    imageView.resources.configuration.uiMode and
+                        android.content.res.Configuration.UI_MODE_NIGHT_MASK ==
+                        android.content.res.Configuration.UI_MODE_NIGHT_YES
+                    )
+                imageView.setImageDrawable(
+                    WeTypeIconDrawable(
+                        if (isDark) LOGO_DARK_BG_ALPHA_FRACTION
+                        else LOGO_LIGHT_BG_ALPHA_FRACTION
+                    )
+                )
+            }
+        }
+    }
+
+    private inline fun forEachView(rootView: View, action: (View) -> Unit) {
+        val pending = java.util.ArrayDeque<View>()
+        pending.add(rootView)
+        while (pending.isNotEmpty()) {
+            val view = pending.removeFirst()
+            action(view)
+            if (view is ViewGroup) {
+                for (index in 0 until view.childCount) pending.addLast(view.getChildAt(index))
+            }
         }
     }
 
@@ -814,29 +900,24 @@ internal object WeTypeResourceHooks {
             val sClass = loadClassOrNull("com.tencent.wetype.plugin.hld.s") ?: return
             val containerId = sClass.getField("custom_toolbar_item_container_view").getInt(null)
 
-            val updateBackgroundOpacity = object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val view = param.thisObject as? android.view.View ?: return
-                    if (view.id == containerId) {
-                        val drawable = param.args[0] as? android.graphics.drawable.Drawable ?: return
-                        val opacity = WeTypeSettings.getToolbarIconBgOpacityXposed()
-                        drawable.alpha = opacity
-                    }
-                }
-            }
-
-            XposedHelpers.findAndHookMethod(
-                android.view.View::class.java,
+            View::class.java.getMethod(
                 "setBackground",
-                android.graphics.drawable.Drawable::class.java,
-                updateBackgroundOpacity
-            )
-            XposedHelpers.findAndHookMethod(
-                android.view.View::class.java,
+                Drawable::class.java
+            ).hookBefore { param ->
+                val view = param.thisObject as? View ?: return@hookBefore
+                if (view.id != containerId) return@hookBefore
+                val drawable = param.args[0] as? Drawable ?: return@hookBefore
+                drawable.alpha = WeTypeSettings.getToolbarIconBgOpacityXposed()
+            }
+            View::class.java.getMethod(
                 "setBackgroundDrawable",
-                android.graphics.drawable.Drawable::class.java,
-                updateBackgroundOpacity
-            )
+                Drawable::class.java
+            ).hookBefore { param ->
+                val view = param.thisObject as? View ?: return@hookBefore
+                if (view.id != containerId) return@hookBefore
+                val drawable = param.args[0] as? Drawable ?: return@hookBefore
+                drawable.alpha = WeTypeSettings.getToolbarIconBgOpacityXposed()
+            }
             Log.i("Success: Hook WeType toolbar icon background")
         }.onFailure {
             Log.i("Failed: Hook WeType toolbar icon background")
@@ -1018,16 +1099,82 @@ internal object WeTypeResourceHooks {
             }
 
             override fun onViewDetachedFromWindow(v: View) {
-                candidatePinyinMarginListeners.remove(v)?.also { v.removeOnLayoutChangeListener(it) }
+                candidatePinyinMarginListeners.remove(v)?.let { listeners ->
+                    v.removeOnLayoutChangeListener(listeners.layout)
+                }
                 v.removeOnAttachStateChangeListener(this)
             }
         }
         view.addOnLayoutChangeListener(layoutListener)
         view.addOnAttachStateChangeListener(attachStateListener)
-        candidatePinyinMarginListeners[view] = layoutListener
+        candidatePinyinMarginListeners[view] = CandidatePinyinListeners(
+            layout = layoutListener,
+            attach = attachStateListener
+        )
+    }
+
+    /**
+     * Releases view listeners, restores host logo drawables, and clears per-generation caches
+     * before API 102 hot reload retires this module generation.
+     */
+    fun prepareForHotReload() {
+        synchronized(candidatePinyinMarginListeners) {
+            candidatePinyinMarginListeners.forEach { (view, listeners) ->
+                runCatching { view.removeOnLayoutChangeListener(listeners.layout) }
+                runCatching { view.removeOnAttachStateChangeListener(listeners.attach) }
+            }
+            candidatePinyinMarginListeners.clear()
+        }
+        synchronized(candidatePinyinOriginalPaddings) {
+            candidatePinyinOriginalPaddings.forEach { (view, padding) ->
+                runCatching {
+                    view.setPaddingRelative(
+                        padding.start,
+                        padding.top,
+                        padding.end,
+                        padding.bottom
+                    )
+                }
+            }
+            candidatePinyinOriginalPaddings.clear()
+        }
+
+        val logoStates = synchronized(replacedLogoStates) {
+            replacedLogoStates.entries.toList().also { replacedLogoStates.clear() }
+        }
+        restoringLogoDrawable.set(true)
+        try {
+            logoStates.forEach { (imageView, state) ->
+                runCatching {
+                    state.resourceId?.let(imageView::setImageResource)
+                        ?: imageView.setImageDrawable(state.drawable)
+                }
+            }
+        } finally {
+            restoringLogoDrawable.remove()
+        }
+
+        synchronized(typedArrayAttributeCache) { typedArrayAttributeCache.clear() }
+        synchronized(resourcePackageCache) { resourcePackageCache.clear() }
+        synchronized(candidateItemRootBaseLeftPaddingPx) { candidateItemRootBaseLeftPaddingPx.clear() }
+        synchronized(candidateItemRootAppliedLeftPaddingPx) {
+            candidateItemRootAppliedLeftPaddingPx.clear()
+        }
+        synchronized(appearanceColorParamsLock) {
+            cachedAppearanceColors = null
+            cachedAppearanceColorParams = emptyMap()
+        }
+        candidateMarginInsetWriteDepth.remove()
+        hsvScratchThreadLocal.remove()
     }
 
     private fun applyCandidatePinyinLeftMargin(view: View) {
+        synchronized(candidatePinyinOriginalPaddings) {
+            candidatePinyinOriginalPaddings.putIfAbsent(
+                view,
+                ViewPadding(view.paddingStart, view.paddingTop, view.paddingEnd, view.paddingBottom)
+            )
+        }
         val startPadding = TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP,
             WeTypeSettings.getCandidatePinyinLeftMarginDpXposed().toFloat(),
@@ -1058,7 +1205,7 @@ internal object WeTypeResourceHooks {
         ).forEach { view ->
             view ?: return@forEach
             forceOpaqueBackground(view)
-            view.post { forceOpaqueBackground(view) }
+            HookEnvironment.postTracked(view) { forceOpaqueBackground(view) }
         }
     }
 

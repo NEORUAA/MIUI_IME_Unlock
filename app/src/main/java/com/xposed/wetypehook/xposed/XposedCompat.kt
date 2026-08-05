@@ -1,12 +1,16 @@
 package com.xposed.wetypehook.xposed
 
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XC_MethodReplacement
-import de.robv.android.xposed.XposedBridge
+import android.util.Log as AndroidLog
+import android.view.View
+import io.github.libxposed.api.XposedInterface
+import io.github.libxposed.api.XposedModule
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
+import java.util.Collections
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 
 private data class ClassCacheKey(
     val name: String,
@@ -32,6 +36,44 @@ object HookEnvironment {
     @Volatile
     private var currentLogTag: String = "xposed"
 
+    @Volatile
+    private var currentModule: XposedModule? = null
+
+    private val hookHandles = CopyOnWriteArrayList<XposedInterface.HookHandle>()
+    private val hookSequenceLock = Any()
+    private val hookSequences = HashMap<String, Int>()
+    private val currentScope = ThreadLocal.withInitial { "global" }
+    private val trackedCallbacks = Collections.synchronizedMap(
+        WeakHashMap<View, MutableSet<Runnable>>()
+    )
+
+    /**
+     * Attaches the current module generation to the compatibility layer.
+     *
+     * The framework owns the XposedInterface instance exposed by XposedModule. Keeping the
+     * module reference here lets the legacy-shaped helper functions below retain their call-site
+     * API while all actual registrations go through libxposed's interceptor chain.
+     */
+    fun attach(module: XposedModule, classLoader: ClassLoader? = null, logTag: String = "xposed") {
+        currentModule = module
+        currentClassLoader = classLoader
+        currentLogTag = logTag
+        synchronized(hookSequenceLock) {
+            hookSequences.clear()
+        }
+        currentScope.set("global")
+        cancelTrackedCallbacks()
+    }
+
+    fun updateClassLoader(classLoader: ClassLoader?) {
+        currentClassLoader = classLoader
+    }
+
+    /**
+     * Kept as a source-compatible bridge while callers move to the modern lifecycle callbacks.
+     * Hook registration itself still requires [attach] to have supplied the module instance.
+     */
+    @Deprecated("Use attach(XposedModule, ClassLoader?, String) from onModuleLoaded")
     fun init(classLoader: ClassLoader?, logTag: String) {
         currentClassLoader = classLoader
         currentLogTag = logTag
@@ -41,6 +83,118 @@ object HookEnvironment {
         explicitClassLoader ?: currentClassLoader
 
     internal fun logTag(): String = currentLogTag
+
+    internal fun moduleOrNull(): XposedModule? = currentModule
+
+    fun <T> withHookScope(scope: String, block: () -> T): T {
+        val previous = currentScope.get()
+        currentScope.set(scope.ifBlank { "global" })
+        return try {
+            block()
+        } finally {
+            currentScope.set(previous)
+        }
+    }
+
+    fun prepareForHotReload(oldHandles: List<XposedInterface.HookHandle>? = null) {
+        cancelTrackedCallbacks()
+        currentScope.set("global")
+        synchronized(hookSequenceLock) {
+            hookSequences.clear()
+        }
+    }
+
+    fun finishHotReload(oldHandles: List<XposedInterface.HookHandle>) {
+        oldHandles.forEach { handle ->
+            runCatching { handle.unhook() }
+        }
+    }
+
+    /**
+     * Posts a callback that is cancelled automatically by [cancelTrackedCallbacks] during hot
+     * reload. This prevents old-generation lambdas from remaining in a target View's message
+     * queue and retaining the old module classloader.
+     */
+    fun postTracked(view: View, delayMillis: Long = 0L, block: () -> Unit): Boolean {
+        lateinit var callback: Runnable
+        callback = Runnable {
+            try {
+                block()
+            } finally {
+                synchronized(trackedCallbacks) {
+                    trackedCallbacks[view]?.let { callbacks ->
+                        callbacks.remove(callback)
+                        if (callbacks.isEmpty()) trackedCallbacks.remove(view)
+                    }
+                }
+            }
+        }
+
+        synchronized(trackedCallbacks) {
+            trackedCallbacks.getOrPut(view) { LinkedHashSet() }.add(callback)
+        }
+        val posted = if (delayMillis > 0L) {
+            view.postDelayed(callback, delayMillis)
+        } else {
+            view.post(callback)
+        }
+        if (!posted) {
+            synchronized(trackedCallbacks) {
+                trackedCallbacks[view]?.let { callbacks ->
+                    callbacks.remove(callback)
+                    if (callbacks.isEmpty()) trackedCallbacks.remove(view)
+                }
+            }
+        }
+        return posted
+    }
+
+    fun cancelTrackedCallbacks() {
+        val pending = synchronized(trackedCallbacks) {
+            trackedCallbacks.entries.flatMap { (view, callbacks) ->
+                callbacks.map { callback -> view to callback }
+            }.also { trackedCallbacks.clear() }
+        }
+        pending.forEach { (view, callback) ->
+            runCatching { view.removeCallbacks(callback) }
+        }
+    }
+
+    internal fun registerHook(
+        method: Method,
+        kind: String,
+        hooker: XposedInterface.Hooker
+    ): XposedInterface.HookHandle {
+        val module = currentModule
+            ?: throw IllegalStateException("XposedModule is not attached before hooking ${method.name}")
+        val id = nextHookId(method, kind)
+        return module.hook(method)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .setId(id)
+            .intercept(hooker)
+            .also(hookHandles::add)
+    }
+
+    private fun nextHookId(method: Method, kind: String): String {
+        val scope = currentScope.get().ifBlank { "global" }
+        val executableKey = buildString {
+            append(method.declaringClass.name)
+            append('#')
+            append(method.name)
+            append('(')
+            append(method.parameterTypes.joinToString(",") { it.name })
+            append(')')
+            append(':')
+            append(method.returnType.name)
+        }
+        val sequenceKey = "$scope|$kind|$executableKey"
+        val sequence = synchronized(hookSequenceLock) {
+            val next = hookSequences[sequenceKey] ?: 0
+            hookSequences[sequenceKey] = next + 1
+            next
+        }
+        return "api102:$scope:$kind:$executableKey:$sequence"
+    }
 }
 
 object Log {
@@ -53,12 +207,23 @@ object Log {
     }
 
     private fun log(level: String, message: Any?) {
+        val priority = if (level == "E") AndroidLog.ERROR else AndroidLog.INFO
+        val module = HookEnvironment.moduleOrNull()
         if (message is Throwable) {
-            XposedBridge.log("[${HookEnvironment.logTag()}][$level] ${message.message ?: message.javaClass.name}")
-            XposedBridge.log(message)
+            val text = "[${HookEnvironment.logTag()}][$level] ${message.message ?: message.javaClass.name}"
+            if (module != null) {
+                module.log(priority, HookEnvironment.logTag(), text, message)
+            } else {
+                AndroidLog.println(priority, HookEnvironment.logTag(), text)
+            }
             return
         }
-        XposedBridge.log("[${HookEnvironment.logTag()}][$level] ${message ?: "null"}")
+        val text = "[${HookEnvironment.logTag()}][$level] ${message ?: "null"}"
+        if (module != null) {
+            module.log(priority, HookEnvironment.logTag(), text)
+        } else {
+            AndroidLog.println(priority, HookEnvironment.logTag(), text)
+        }
     }
 }
 
@@ -131,39 +296,90 @@ fun Array<Class<*>>.sameAs(vararg types: Class<*>): Boolean {
     }
 }
 
-fun Method.hookBefore(callback: (XC_MethodHook.MethodHookParam) -> Unit) {
-    XposedBridge.hookMethod(
-        this,
-        object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                callback(param)
-            }
+private object StaticHookThisObject
+
+class MethodHookParam internal constructor(
+    val method: Method,
+    thisObject: Any?,
+    args: Array<Any?>,
+    result: Any? = null
+) {
+    /**
+     * Existing call sites treat the hooked receiver as non-null. Keep that source shape for
+     * instance hooks; static hooks receive an internal sentinel and ignore this field.
+     */
+    val thisObject: Any = thisObject ?: StaticHookThisObject
+
+    var args: Array<Any?> = args
+
+    var result: Any? = result
+        set(value) {
+            field = value
+            resultWasSet = true
         }
-    )
+
+    internal var resultWasSet: Boolean = false
 }
 
-fun Method.hookAfter(callback: (XC_MethodHook.MethodHookParam) -> Unit) {
-    XposedBridge.hookMethod(
-        this,
-        object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                callback(param)
-            }
+fun Method.hookBefore(callback: (MethodHookParam) -> Unit) {
+    val method = this
+    HookEnvironment.registerHook(method, "before") { chain ->
+        val param = MethodHookParam(
+            method = method,
+            thisObject = chain.thisObject,
+            args = chain.args.toTypedArray()
+        )
+        val callbackResult = runCatching { callback(param) }
+        val callbackFailure = callbackResult.exceptionOrNull()
+        if (callbackFailure != null) {
+            Log.e(callbackFailure)
+            chain.proceed(param.args)
+        } else if (param.resultWasSet) {
+            param.result
+        } else {
+            chain.proceed(param.args)
         }
-    )
+    }
 }
 
-fun Method.hookReplace(callback: (XC_MethodHook.MethodHookParam) -> Any?) {
-    XposedBridge.hookMethod(
-        this,
-        object : XC_MethodReplacement() {
-            override fun replaceHookedMethod(param: MethodHookParam): Any? = callback(param)
+fun Method.hookAfter(callback: (MethodHookParam) -> Unit) {
+    val method = this
+    HookEnvironment.registerHook(method, "after") { chain ->
+        val originalResult = chain.proceed()
+        val param = MethodHookParam(
+            method = method,
+            thisObject = chain.thisObject,
+            args = chain.args.toTypedArray(),
+            result = originalResult
+        )
+        try {
+            callback(param)
+            param.result
+        } catch (throwable: Throwable) {
+            Log.e(throwable)
+            originalResult
         }
-    )
+    }
+}
+
+fun Method.hookReplace(callback: (MethodHookParam) -> Any?) {
+    val method = this
+    HookEnvironment.registerHook(method, "replace") { chain ->
+        val param = MethodHookParam(
+            method = method,
+            thisObject = chain.thisObject,
+            args = chain.args.toTypedArray()
+        )
+        runCatching { callback(param) }.getOrElse { throwable ->
+            Log.e(throwable)
+            chain.proceed(param.args)
+        }
+    }
 }
 
 fun Method.hookReturnConstant(result: Any?) {
-    XposedBridge.hookMethod(this, XC_MethodReplacement.returnConstant(result))
+    val method = this
+    HookEnvironment.registerHook(method, "constant") { result }
 }
 
 @Suppress("UNCHECKED_CAST")

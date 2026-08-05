@@ -183,16 +183,25 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openEmbeddedWeTypeSettings(): Boolean {
+        val bridgePendingIntent = runCatching {
+            ModuleBridgeContract.createSettingsBridgePendingIntent(this)
+        }.getOrNull()
         val launchIntents = listOfNotNull(
             packageManager.getLaunchIntentForPackage("com.tencent.wetype")?.apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 putExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS, true)
+                bridgePendingIntent?.let {
+                    putExtra(ModuleBridgeContract.EXTRA_BRIDGE_PENDING_INTENT, it)
+                }
             },
             Intent(Intent.ACTION_MAIN).apply {
                 setPackage("com.tencent.wetype")
                 addCategory(Intent.CATEGORY_LAUNCHER)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 putExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS, true)
+                bridgePendingIntent?.let {
+                    putExtra(ModuleBridgeContract.EXTRA_BRIDGE_PENDING_INTENT, it)
+                }
             },
             Intent().apply {
                 component = ComponentName(
@@ -201,6 +210,9 @@ class MainActivity : ComponentActivity() {
                 )
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 putExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS, true)
+                bridgePendingIntent?.let {
+                    putExtra(ModuleBridgeContract.EXTRA_BRIDGE_PENDING_INTENT, it)
+                }
             }
         )
 
@@ -491,8 +503,8 @@ private fun WeTypeSettingsScreen(
         return appearanceGroupColors[groupIndex(group.id)]
     }
 
-    fun saveSettings(showSavedToast: Boolean = true) {
-        WeTypeSettings.save(
+    fun saveSettings(successMessage: Int = R.string.settings_saved): Boolean {
+        return WeTypeSettings.save(
             context = preferencesContext,
             lightColor = lightColor,
             darkColor = darkColor,
@@ -509,11 +521,15 @@ private fun WeTypeSettingsScreen(
                 ?: WeTypeSettings.DEFAULT_CANDIDATE_PINYIN_LEFT_MARGIN_DP,
             toolbarIconBgOpacity = toolbarIconBgOpacity,
             appearanceColors = currentAppearanceColors(),
-            disableHotUpdate = disableHotUpdate
+            disableHotUpdate = disableHotUpdate,
+            onPersisted = { saved ->
+                Toast.makeText(
+                    context,
+                    if (saved) successMessage else R.string.settings_save_failed,
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
         )
-        if (showSavedToast) {
-            Toast.makeText(context, R.string.settings_saved, Toast.LENGTH_SHORT).show()
-        }
     }
 
     fun restoreDefaults() {
@@ -535,8 +551,7 @@ private fun WeTypeSettingsScreen(
             appearanceGroupColors[index] = group.defaultColor
         }
         syncEditorFromState()
-        Toast.makeText(context, context.getString(R.string.settings_reset_toast), Toast.LENGTH_SHORT).show()
-        saveSettings(showSavedToast = false)
+        saveSettings(successMessage = R.string.settings_reset_toast)
     }
 
     if (isEmbeddedHost) {

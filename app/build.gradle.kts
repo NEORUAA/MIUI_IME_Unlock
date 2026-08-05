@@ -33,7 +33,8 @@ android {
     }
     packaging {
         resources {
-            excludes += arrayOf("META-INF/**", "kotlin/**", "google/**", "**.bin")
+            merges += "META-INF/xposed/*"
+            excludes += arrayOf("kotlin/**", "google/**", "**.bin")
         }
     }
     applicationVariants.all {
@@ -55,7 +56,8 @@ kotlin {
 }
 
 dependencies {
-    compileOnly("de.robv.android.xposed:api:82")
+    compileOnly("io.github.libxposed:api:102.0.0")
+    implementation("io.github.libxposed:service:102.0.0")
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.compose.foundation:foundation-android:1.11.4")
     implementation("androidx.compose.ui:ui-android:1.11.4")

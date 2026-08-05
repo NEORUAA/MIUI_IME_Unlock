@@ -16,6 +16,7 @@
     <string name="settings_reset">Restore defaults</string>
     <string name="settings_restart">Restart WeType</string>
     <string name="settings_saved">Settings saved</string>
+    <string name="settings_save_failed">Could not save settings</string>
     <string name="settings_invalid_color">Invalid color format. Please use #RRGGBB.</string>
     <string name="settings_root_required">Root permission is required</string>
     <string name="settings_restart_done">WeType restarted</string>

@@ -22,8 +22,10 @@
 
 -repackageclasses "miuiime"
 
--keep class com.xposed.wetypehook.MainHook {
-    <init>();
+-dontwarn io.github.libxposed.annotation.**
+-adaptresourcefilecontents META-INF/xposed/java_init.list
+-keep,allowoptimization,allowobfuscation public class * extends io.github.libxposed.api.XposedModule {
+    public <init>();
 }
 
 # DexKit 通过 JNI 回调这些类型，混淆后 native 层无法解析

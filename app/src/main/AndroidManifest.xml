@@ -6,7 +6,9 @@
     </queries>
 
     <application
+        android:name=".ModuleApplication"
         android:allowBackup="true"
+        android:description="@string/xposeddescription"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -22,23 +24,8 @@
             </intent-filter>
         </activity>
         <receiver
-            android:name=".ModuleActivationReceiver"
+            android:name=".ModuleBridgeReceiver"
             android:enabled="true"
             android:exported="true" />
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposedsharedprefs"
-            android:value="true" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="@string/xposeddescription" />
-        <meta-data
-            android:name="xposedminversion"
-            android:value="93" />
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/HookList" />
     </application>
 </manifest>

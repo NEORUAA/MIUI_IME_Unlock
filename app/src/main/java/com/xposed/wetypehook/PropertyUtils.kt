@@ -1,7 +1,7 @@
 package com.xposed.wetypehook
 
 import android.annotation.SuppressLint
-import de.robv.android.xposed.XposedBridge
+import com.xposed.wetypehook.xposed.Log
 import java.lang.reflect.Method
 
 object PropertyUtils {
@@ -15,7 +15,7 @@ object PropertyUtils {
         kotlin.runCatching {
             get.invoke(null, prop, defaultValue) as String?
         }.onFailure {
-            XposedBridge.log(it)
+            Log.e(it)
         }.onSuccess {
             return it
         }

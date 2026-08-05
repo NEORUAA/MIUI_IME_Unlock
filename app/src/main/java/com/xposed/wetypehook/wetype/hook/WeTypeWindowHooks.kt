@@ -6,6 +6,8 @@ import android.graphics.Outline
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.inputmethodservice.InputMethodService
+import android.os.Handler
+import android.os.Looper
 import android.view.RoundedCorner
 import android.view.View
 import android.view.ViewGroup
@@ -15,6 +17,7 @@ import android.view.inputmethod.EditorInfo
 import android.widget.FrameLayout
 import androidx.core.graphics.drawable.toDrawable
 import com.xposed.wetypehook.xposed.Log
+import com.xposed.wetypehook.xposed.HookEnvironment
 import com.xposed.wetypehook.xposed.getObjectAs
 import com.xposed.wetypehook.xposed.hookAfter
 import com.xposed.wetypehook.xposed.invokeMethodAs
@@ -24,6 +27,8 @@ import com.xposed.wetypehook.wetype.graphics.WeTypeCornerRadii
 import com.xposed.wetypehook.wetype.graphics.createWeTypeContinuousRoundedPath
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
 import java.util.WeakHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 private const val WETYPE_BLUR_APPLY_MAX_RETRY = 6
 private const val WETYPE_BACKGROUND_SETTLE_RETRY = 3
@@ -50,7 +55,11 @@ internal object WeTypeWindowHooks {
         var computedVisibleImeHeightPx: Int? = null,
         var bottomLeftHardwareCornerRadius: Float? = null,
         var bottomRightHardwareCornerRadius: Float? = null,
-        var hardwareViewIds: IntArray? = null
+        var hardwareViewIds: IntArray? = null,
+        var originalWindowStateCaptured: Boolean = false,
+        var originalWindowBackground: Drawable? = null,
+        var originalWindowBlurRadius: Int? = null,
+        val outlineSnapshots: MutableMap<View, Pair<Boolean, ViewOutlineProvider?>> = WeakHashMap()
     )
 
     private data class WeTypeViewSnapshot(
@@ -91,6 +100,39 @@ internal object WeTypeWindowHooks {
 
     private val weTypeWindowStates = WeakHashMap<Any, WeTypeWindowState>()
 
+    fun prepareForHotReload(): Boolean {
+        val states = synchronized(weTypeWindowStates) {
+            weTypeWindowStates.values.toList()
+        }
+        val cleaned = runOnMainThreadBlocking {
+            states.forEach { state ->
+                state.blurApplyToken++
+                state.windowVisible = false
+                state.blurEligible = false
+                state.registeredViews.forEach { view ->
+                    state.heightChangeListener?.let { view.removeOnLayoutChangeListener(it) }
+                }
+                state.registeredViews.clear()
+                state.heightChangeListener = null
+                state.outlineSnapshots.forEach { (view, snapshot) ->
+                    view.clipToOutline = snapshot.first
+                    view.outlineProvider = snapshot.second
+                    view.invalidateOutline()
+                }
+                state.outlineSnapshots.clear()
+                restoreWindowState(state)
+                removeBackgroundCarrier(state)
+                state.inputMethodService = null
+            }
+        }
+        if (cleaned) {
+            synchronized(weTypeWindowStates) {
+                weTypeWindowStates.clear()
+            }
+        }
+        return cleaned
+    }
+
     fun hookWindowBlur() {
         runCatching {
             val inputMethodService = loadClassOrNull("android.inputmethodservice.InputMethodService")
@@ -102,10 +144,12 @@ internal object WeTypeWindowHooks {
                 Boolean::class.javaPrimitiveType
             ).hookAfter { param ->
                 onWindowStage(param.thisObject, "onStartInputView")
+                reconcileCurrentResourceViews(param.thisObject)
             }
             runCatching {
                 inputMethodService.getMethod("onWindowShown").hookAfter { param ->
                     onWindowStage(param.thisObject, "onWindowShown")
+                    reconcileCurrentResourceViews(param.thisObject)
                 }
             }
             runCatching {
@@ -165,6 +209,44 @@ internal object WeTypeWindowHooks {
         }.onFailure {
             Log.i("Failed: Hook WeType window corner")
             Log.i(it)
+        }
+    }
+
+    fun reconcileCurrentInputMethodService(
+        inputMethodService: InputMethodService,
+        attempt: Int = 0
+    ) {
+        if (!inputMethodService.isInputViewShown) {
+            if (attempt >= WETYPE_BACKGROUND_SETTLE_RETRY) return
+            val decorView = runCatching {
+                val softInputWindow = inputMethodService.invokeMethodAs<Any>("getWindow")
+                softInputWindow?.invokeMethodAs<Window>("getWindow")?.decorView
+            }.getOrNull() ?: return
+            HookEnvironment.postTracked(decorView, 100L) {
+                reconcileCurrentInputMethodService(inputMethodService, attempt + 1)
+            }
+            return
+        }
+        val state = getWindowState(inputMethodService)
+        state.windowVisible = true
+        state.blurEligible = true
+        state.computedVisibleImeHeightPx = null
+        applyWindowCorner(inputMethodService)
+        scheduleWindowBlur(inputMethodService)
+        reconcileCurrentResourceViews(inputMethodService)
+    }
+
+    private fun reconcileCurrentResourceViews(inputMethodService: Any) {
+        val decorView = runCatching {
+            val softInputWindow = inputMethodService.invokeMethodAs<Any>("getWindow")
+            softInputWindow?.invokeMethodAs<Window>("getWindow")?.decorView
+        }.getOrNull() ?: return
+        WeTypeResourceHooks.reconcileCurrentKeyboardLogos(listOf(decorView))
+        HookEnvironment.postTracked(decorView) {
+            WeTypeResourceHooks.reconcileCurrentKeyboardLogos(listOf(decorView))
+        }
+        HookEnvironment.postTracked(decorView, 100L) {
+            WeTypeResourceHooks.reconcileCurrentKeyboardLogos(listOf(decorView))
         }
     }
 
@@ -255,7 +337,9 @@ internal object WeTypeWindowHooks {
             }
 
             if (attempt >= WETYPE_BLUR_APPLY_MAX_RETRY) return
-            decorView.post { applyWindowBlurWhenReady(inputMethodService, token, attempt + 1) }
+            HookEnvironment.postTracked(decorView) {
+                applyWindowBlurWhenReady(inputMethodService, token, attempt + 1)
+            }
         }.onFailure {
             Log.i("Failed: Apply WeType window blur")
             Log.i(it)
@@ -274,7 +358,7 @@ internal object WeTypeWindowHooks {
             val window = softInputWindow.invokeMethodAs<Window>("getWindow") ?: return
             val decorView = window.decorView
 
-            decorView.post {
+            HookEnvironment.postTracked(decorView) {
                 runCatching {
                     val latestState = getWindowState(inputMethodService)
                     if (latestState.blurApplyToken != token) return@runCatching
@@ -310,7 +394,7 @@ internal object WeTypeWindowHooks {
             val window = softInputWindow.invokeMethodAs<Window>("getWindow") ?: return
             val decorView = window.decorView
             val cornerRadii = resolveCornerRadii(decorView, decorView.context, state)
-            applyContinuousCornerOutline(decorView, cornerRadii)
+            applyContinuousCornerOutline(decorView, cornerRadii, state)
         }
     }
 
@@ -393,6 +477,13 @@ internal object WeTypeWindowHooks {
         state: WeTypeWindowState,
         snapshot: WeTypeWindowSnapshot
     ) {
+        if (!state.originalWindowStateCaptured) {
+            state.originalWindowBackground = decorView.background
+            state.originalWindowBlurRadius = runCatching {
+                Window::class.java.getMethod("getBackgroundBlurRadius").invoke(window) as? Int
+            }.getOrNull()
+            state.originalWindowStateCaptured = true
+        }
         window.setBackgroundBlurRadius(0)
         window.setBackgroundDrawable(Color.TRANSPARENT.toDrawable())
 
@@ -420,7 +511,7 @@ internal object WeTypeWindowHooks {
         }
 
         carrier.visibility = View.VISIBLE
-        applyContinuousCornerOutline(carrier, cornerRadii)
+        applyContinuousCornerOutline(carrier, cornerRadii, state)
         carrier.background = createBackgroundDrawable(carrier, context, cornerRadii)
         setupHeightChangeListeners(inputMethodService, context, state)
     }
@@ -555,6 +646,20 @@ internal object WeTypeWindowHooks {
         state.inputMethodService = null
     }
 
+    private fun restoreWindowState(state: WeTypeWindowState) {
+        if (!state.originalWindowStateCaptured) return
+        val inputMethodService = state.inputMethodService ?: return
+        runCatching {
+            val softInputWindow = inputMethodService.invokeMethodAs<Any>("getWindow") ?: return@runCatching
+            val window = softInputWindow.invokeMethodAs<Window>("getWindow") ?: return@runCatching
+            window.setBackgroundBlurRadius(state.originalWindowBlurRadius ?: 0)
+            window.setBackgroundDrawable(state.originalWindowBackground)
+        }
+        state.originalWindowStateCaptured = false
+        state.originalWindowBackground = null
+        state.originalWindowBlurRadius = null
+    }
+
     private fun createBackgroundDrawable(targetView: View, context: Context, cornerRadii: WeTypeCornerRadii): Drawable {
         val color = WeTypeSettings.getCurrentBackgroundColorXposed(context)
         val blurRadius = WeTypeSettings.getBlurRadiusXposed(context)
@@ -611,7 +716,12 @@ internal object WeTypeWindowHooks {
         setColor(color)
     }
 
-    private fun applyContinuousCornerOutline(view: View, cornerRadii: WeTypeCornerRadii) {
+    private fun applyContinuousCornerOutline(
+        view: View,
+        cornerRadii: WeTypeCornerRadii,
+        state: WeTypeWindowState
+    ) {
+        state.outlineSnapshots.putIfAbsent(view, view.clipToOutline to view.outlineProvider)
         view.clipToOutline = true
         view.outlineProvider = object : ViewOutlineProvider() {
             override fun getOutline(target: View, outline: Outline) {
@@ -628,5 +738,35 @@ internal object WeTypeWindowHooks {
             }
         }
         view.invalidateOutline()
+    }
+
+    private fun runOnMainThreadBlocking(block: () -> Unit): Boolean {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return runCatching(block).onFailure {
+                Log.i("Failed: Cleanup WeType window state for hot reload")
+                Log.i(it)
+            }.isSuccess
+        }
+
+        val completed = CountDownLatch(1)
+        var failure: Throwable? = null
+        if (!Handler(Looper.getMainLooper()).post {
+                try {
+                    block()
+                } catch (error: Throwable) {
+                    failure = error
+                } finally {
+                    completed.countDown()
+                }
+            }
+        ) {
+            return false
+        }
+        val finished = runCatching { completed.await(2, TimeUnit.SECONDS) }.getOrDefault(false)
+        failure?.let {
+            Log.i("Failed: Cleanup WeType window state for hot reload")
+            Log.i(it)
+        }
+        return finished && failure == null
     }
 }

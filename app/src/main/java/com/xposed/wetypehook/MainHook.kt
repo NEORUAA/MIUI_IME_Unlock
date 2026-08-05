@@ -1,4 +1,5 @@
 package com.xposed.wetypehook
+
 import android.app.Activity
 import android.content.Context
 import android.content.res.AssetManager
@@ -7,6 +8,9 @@ import android.content.res.Resources
 import android.graphics.Color
 import android.inputmethodservice.InputMethodService
 import android.os.Binder
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.LayoutInflater
 import android.view.View
@@ -32,9 +36,13 @@ import com.xposed.wetypehook.xposed.loadClassOrNull
 import com.xposed.wetypehook.xposed.putStaticObject
 import com.xposed.wetypehook.xposed.sameAs
 import dalvik.system.BaseDexClassLoader
-import de.robv.android.xposed.IXposedHookLoadPackage
-import de.robv.android.xposed.IXposedHookZygoteInit
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.libxposed.api.XposedInterface
+import io.github.libxposed.api.XposedModule
+import io.github.libxposed.api.XposedModuleInterface.HotReloadedParam
+import io.github.libxposed.api.XposedModuleInterface.HotReloadingParam
+import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
+import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
+import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam
 import org.luckypray.dexkit.DexKitBridge
 import java.lang.reflect.Field
 import java.lang.reflect.Method
@@ -43,6 +51,8 @@ import java.lang.ref.WeakReference
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 private const val TAG = "miuiime"
 private const val WETYPE_PACKAGE = "com.tencent.wetype"
@@ -55,6 +65,13 @@ private const val WETYPE_FONT_ASSET = "fonts/WE-Regular.ttf"
 private const val MODULE_WETYPE_FONT_ASSET = "WE-Regular.ttf"
 private const val TRANSPARENT_BOTTOM_VIEW_DARK_CONTENT = 0xFFF5F5F5.toInt()
 private const val TRANSPARENT_BOTTOM_VIEW_LIGHT_CONTENT = 0xFF202020.toInt()
+private const val TARGET_KIND_SYSTEM = "system"
+private const val TARGET_KIND_PACKAGE = "package"
+private const val TARGET_KIND_PHRASE = "phrase"
+private const val STATE_TARGET_KIND = "target_kind"
+private const val STATE_PACKAGE_NAME = "package_name"
+private const val STATE_SOURCE_DIR = "source_dir"
+private const val STATE_TARGETS = "targets"
 
 private val WETYPE_COLOR_REPLACEMENTS = mapOf(
     "ime_skin_candidate_end_color" to Color.TRANSPARENT,
@@ -71,7 +88,7 @@ private val WETYPE_DRAWABLE_REPLACEMENTS = mapOf(
     "ime_keyboard_full_gradient_bg_color_dark" to R.drawable.wetype_full_gradient_bg_dark
 )
 
-class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
+class MainHook : XposedModule() {
     private val miuiImeList = setOf(
         "com.iflytek.inputmethod.miui",
         "com.sohu.inputmethod.sogou.xiaomi",
@@ -81,6 +98,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     )
     private val installedHookTokens = ConcurrentHashMap.newKeySet<String>()
     private val monitoredImeInputFrames = Collections.newSetFromMap(WeakHashMap<ViewGroup, Boolean>())
+    private val imeInputFrameLayoutListeners = WeakHashMap<ViewGroup, View.OnLayoutChangeListener>()
     private val originalImeContentBottomPaddings = WeakHashMap<View, Int>()
     private val originalFullscreenAreaHeights = WeakHashMap<ViewGroup, IntArray>()
     private val adjustedImeContentViews = WeakHashMap<ViewGroup, WeakReference<View>>()
@@ -90,38 +108,166 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     >()
     private var navBarColor: Int? = null
     private var bottomViewSourceColor: Int? = null
-    private lateinit var modulePath: String
+    private var modulePath: String? = null
     private var moduleAssetManager: AssetManager? = null
     private var moduleResources: Resources? = null
     private var assetManagerAddAssetPathMethod: Method? = null
     private var viewListenerInfoField: Field? = null
     private var onClickListenerField: Field? = null
+    private val originalAboutLogoStates = WeakHashMap<View, AboutLogoState>()
 
-    override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
-        modulePath = startupParam.modulePath
-        ModuleRuntime.updateModuleApkPath(startupParam.modulePath)
+    private val activeTargets = LinkedHashMap<String, ActiveTarget>()
+
+    private data class ActiveTarget(
+        val kind: String,
+        val packageName: String? = null,
+        val sourceDir: String? = null
+    )
+
+    private data class AboutLogoState(
+        val clickListener: View.OnClickListener?,
+        val isClickable: Boolean
+    )
+
+    private val supportedPackages = setOf(
+        MIUI_PHRASE_PACKAGE,
+        "com.iflytek.inputmethod.miui",
+        "com.sohu.inputmethod.sogou.xiaomi",
+        "com.baidu.input_mi",
+        "com.google.android.inputmethod.latin",
+        WETYPE_PACKAGE,
+        "com.xiaomi.type"
+    )
+
+    override fun onModuleLoaded(param: ModuleLoadedParam) {
+        HookEnvironment.attach(this, null, TAG)
+        modulePath = moduleApplicationInfo.sourceDir
+        ModuleRuntime.updateModuleApkPath(modulePath)
+        Log.i(
+            "Loaded in ${param.processName}: $frameworkName $frameworkVersion " +
+                "($frameworkVersionCode), API $apiVersion, properties=0x${frameworkProperties.toString(16)}"
+        )
+
     }
 
-    override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-        HookEnvironment.init(lpparam.classLoader, TAG)
-
+    override fun onSystemServerStarting(param: SystemServerStartingParam) {
+        if (frameworkProperties and XposedInterface.PROP_CAP_SYSTEM == 0L) {
+            Log.i("Skip system_server: framework does not advertise system process support")
+            return
+        }
+        HookEnvironment.updateClassLoader(param.classLoader)
+        recordActiveTarget(ActiveTarget(TARGET_KIND_SYSTEM))
         val isMiuiImeSupport = PropertyUtils["ro.miui.support_miui_ime_bottom", "0"] == "1"
-
-        if (lpparam.packageName == "android") {
-            if (isMiuiImeSupport) {
+        if (isMiuiImeSupport) {
+            HookEnvironment.withHookScope("system.permission") {
                 startPermissionHook()
             }
-        } else if (lpparam.packageName == MIUI_PHRASE_PACKAGE) {
-            if (isMiuiImeSupport) {
-                startPackageValidationHook(lpparam)
-            }
-        } else {
-            startHook(lpparam, isMiuiImeSupport)
         }
     }
 
-    private fun startHook(lpparam: XC_LoadPackage.LoadPackageParam, isMiuiImeSupport: Boolean) {
-        val packageName = lpparam.packageName
+    override fun onPackageReady(param: PackageReadyParam) {
+        val packageName = param.packageName
+        if (packageName !in supportedPackages) {
+            if (param.isFirstPackage) {
+                Log.i("Detach from out-of-scope first package $packageName")
+                detach()
+            }
+            return
+        }
+
+        HookEnvironment.updateClassLoader(param.classLoader)
+        val isMiuiImeSupport = PropertyUtils["ro.miui.support_miui_ime_bottom", "0"] == "1"
+        if (packageName == MIUI_PHRASE_PACKAGE) {
+            recordActiveTarget(ActiveTarget(
+                kind = TARGET_KIND_PHRASE,
+                packageName = packageName,
+                sourceDir = param.applicationInfo.sourceDir
+            ))
+            if (isMiuiImeSupport) {
+                HookEnvironment.withHookScope("phrase.validation") {
+                    startPackageValidationHook(param.applicationInfo.sourceDir, param.classLoader)
+                }
+            }
+        } else {
+            recordActiveTarget(ActiveTarget(TARGET_KIND_PACKAGE, packageName))
+            startHook(packageName, param.classLoader, isMiuiImeSupport)
+        }
+    }
+
+    override fun onHotReloading(param: HotReloadingParam): Boolean {
+        param.setSavedInstanceState(activeTargetsBundle())
+        HookEnvironment.prepareForHotReload()
+
+        val hostClean = WeTypeHostLauncher.prepareForHotReload()
+        val windowClean = WeTypeWindowHooks.prepareForHotReload()
+        val resourcesClean = runOnMainThreadBlocking {
+            WeTypeResourceHooks.prepareForHotReload()
+        }
+        val mainClean = cleanupExternalState()
+        WeTypeSettings.prepareForHotReload()
+        if (!hostClean || !windowClean || !resourcesClean || !mainClean) {
+            Log.e("Reject hot reload because target-process callbacks could not be fully cleaned")
+            return false
+        }
+        Log.i("Old generation is ready for hot reload")
+        return true
+    }
+
+    override fun onHotReloaded(param: HotReloadedParam) {
+        HookEnvironment.attach(this, null, TAG)
+        modulePath = moduleApplicationInfo.sourceDir
+        ModuleRuntime.updateModuleApkPath(modulePath)
+        val targets = (param.savedInstanceState as? Bundle).toActiveTargets()
+        synchronized(activeTargets) {
+            activeTargets.clear()
+            targets.forEach(::recordActiveTargetLocked)
+        }
+        if (targets.isEmpty()) {
+            Log.i("Hot reload has no active target state; remove old hooks")
+            HookEnvironment.finishHotReload(param.oldHookHandles)
+            return
+        }
+
+        val isMiuiImeSupport = PropertyUtils["ro.miui.support_miui_ime_bottom", "0"] == "1"
+        val bottomManagersToReconcile = LinkedHashSet<Class<*>>()
+        val packageNamesToReconcile = LinkedHashSet<String>()
+        targets.forEach { target ->
+            val classLoader = resolveHotReloadClassLoader(target, param.oldHookHandles)
+            HookEnvironment.updateClassLoader(classLoader)
+            when (target.kind) {
+                TARGET_KIND_SYSTEM -> if (isMiuiImeSupport) {
+                    HookEnvironment.withHookScope("system.permission") { startPermissionHook() }
+                }
+
+                TARGET_KIND_PHRASE -> if (isMiuiImeSupport && target.sourceDir != null) {
+                    HookEnvironment.withHookScope("phrase.validation") {
+                        startPackageValidationHook(target.sourceDir, classLoader)
+                    }
+                }
+
+                TARGET_KIND_PACKAGE -> target.packageName?.let { packageName ->
+                    startHook(packageName, classLoader, isMiuiImeSupport)
+                    bottomManagersToReconcile += reinstallDynamicBottomManagerHooks(
+                        param.oldHookHandles,
+                        packageName
+                    )
+                    packageNamesToReconcile += packageName
+                }
+            }
+        }
+        HookEnvironment.finishHotReload(param.oldHookHandles)
+        runOnMainThreadBlocking {
+            bottomManagersToReconcile.forEach(::reconcileCurrentImeFrame)
+        }
+        if (WETYPE_PACKAGE in packageNamesToReconcile) reconcileCurrentWeTypeUiAfterHotReload()
+        Log.i("Hot reload completed for ${targets.joinToString { it.packageName ?: it.kind }}")
+    }
+
+    private fun startHook(
+        packageName: String,
+        classLoader: ClassLoader,
+        isMiuiImeSupport: Boolean
+    ) {
         val isWeType = packageName == WETYPE_PACKAGE
 
         if (isWeType) {
@@ -134,41 +280,58 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         val isNonCustomize = packageName !in miuiImeList
         if (isNonCustomize) {
-            installBaseImeHooks(isWeType)
+            HookEnvironment.withHookScope("miui.base") {
+                installBaseImeHooks(isWeType)
+            }
         }
 
-        hookDeleteNotSupportIme(
-            "android.inputmethodservice.InputMethodServiceInjector\$MiuiSwitchInputMethodListener",
-            lpparam.classLoader
-        )
+        HookEnvironment.withHookScope("miui.delete-unsupported") {
+            hookDeleteNotSupportIme(
+                "android.inputmethodservice.InputMethodServiceInjector\$MiuiSwitchInputMethodListener",
+                classLoader
+            )
+        }
 
-        hookInputMethodModuleManager(isNonCustomize)
+        HookEnvironment.withHookScope("miui.dynamic-loader") {
+            hookInputMethodModuleManager(isNonCustomize)
+        }
 
         Log.i("Hook MIUI IME Done!")
     }
 
     private fun installWeTypeHooks(sourcePackage: String) {
-        hookActivationHeartbeat(sourcePackage)
-        WeTypeSettings.configureStorage(sourcePackage)
-        WeTypeSettings.initXposed()
-        hookWeTypeFont()
-        hookWeTypeTransparentColors()
-        hookWeTypeXmlDrawables()
-        hookWeTypeSelfDrawKeyColors()
-        hookWeTypeKeyboardKeyCorner()
-        hookWeTypeCandidateSpecialTextColor()
-        hookWeTypeCandidateBackgroundAlpha()
-        hookWeTypeCandidateBackgroundLeftMargin()
-        hookWeTypeCandidateBackgroundCorner()
-        hookWeTypeCandidatePinyinLeftMargin()
-        hookWeTypeSettingKeyboardOpaqueBackground()
-        hookWeTypeWindowBlur()
-        hookWeTypeWindowCorner()
-        hookWeTypeDisableHotUpdate()
-        hookWeTypeIntentEntry()
-        hookWeTypeAboutLogoEntry()
-        WeTypeResourceHooks.hookKeyboardLogo()
-        WeTypeResourceHooks.hookToolbarIconBackground()
+        if (frameworkProperties and XposedInterface.PROP_CAP_REMOTE != 0L) {
+            runCatching {
+                WeTypeSettings.bindRemotePreferences(
+                    getRemotePreferences(WeTypeSettings.PREF_GROUP)
+                )
+            }.onFailure { error ->
+                Log.e("Remote preferences are unavailable; WeType hooks use defaults")
+                Log.i(error)
+            }
+        } else {
+            Log.i("Remote preferences are unavailable; WeType hooks use defaults")
+        }
+
+        HookEnvironment.withHookScope("wetype.activation") { hookActivationHeartbeat(sourcePackage) }
+        HookEnvironment.withHookScope("wetype.font") { hookWeTypeFont() }
+        HookEnvironment.withHookScope("wetype.colors") { hookWeTypeTransparentColors() }
+        HookEnvironment.withHookScope("wetype.xml-drawables") { hookWeTypeXmlDrawables() }
+        HookEnvironment.withHookScope("wetype.self-draw-colors") { hookWeTypeSelfDrawKeyColors() }
+        HookEnvironment.withHookScope("wetype.key-corner") { hookWeTypeKeyboardKeyCorner() }
+        HookEnvironment.withHookScope("wetype.candidate-text") { hookWeTypeCandidateSpecialTextColor() }
+        HookEnvironment.withHookScope("wetype.candidate-alpha") { hookWeTypeCandidateBackgroundAlpha() }
+        HookEnvironment.withHookScope("wetype.candidate-margin") { hookWeTypeCandidateBackgroundLeftMargin() }
+        HookEnvironment.withHookScope("wetype.candidate-corner") { hookWeTypeCandidateBackgroundCorner() }
+        HookEnvironment.withHookScope("wetype.pinyin-margin") { hookWeTypeCandidatePinyinLeftMargin() }
+        HookEnvironment.withHookScope("wetype.settings-background") { hookWeTypeSettingKeyboardOpaqueBackground() }
+        HookEnvironment.withHookScope("wetype.window-blur") { hookWeTypeWindowBlur() }
+        HookEnvironment.withHookScope("wetype.window-corner") { hookWeTypeWindowCorner() }
+        HookEnvironment.withHookScope("wetype.disable-update") { hookWeTypeDisableHotUpdate() }
+        HookEnvironment.withHookScope("wetype.intent-entry") { hookWeTypeIntentEntry() }
+        HookEnvironment.withHookScope("wetype.about-entry") { hookWeTypeAboutLogoEntry() }
+        HookEnvironment.withHookScope("wetype.keyboard-logo") { WeTypeResourceHooks.hookKeyboardLogo() }
+        HookEnvironment.withHookScope("wetype.toolbar-icon") { WeTypeResourceHooks.hookToolbarIconBackground() }
     }
 
     private fun installBaseImeHooks(forceTransparentBottomView: Boolean) {
@@ -194,7 +357,9 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     if (!isBottomManagerLoaded(targetClassLoader)) {
                         targetClassLoader.invokeMethodAs<Any?>("addDexPath", dexPath)
                     }
-                    installBottomManagerHooks(targetClassLoader, isNonCustomize)
+                    HookEnvironment.withHookScope("miui.dynamic-bottom") {
+                        installBottomManagerHooks(targetClassLoader, isNonCustomize)
+                    }
                     param.result = null
                 }.onFailure {
                     Log.e("Failed:Handle InputMethodModuleManager.loadDex")
@@ -287,23 +452,33 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             WeakReference(bottomArea)
         )
         if (monitoredImeInputFrames.add(inputFrame)) {
-            inputFrame.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            val listener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
                 reconcileMiuiBottomFrame(inputFrame)
             }
+            imeInputFrameLayoutListeners[inputFrame] = listener
+            inputFrame.addOnLayoutChangeListener(listener)
         }
-        inputFrame.post { reconcileMiuiBottomFrame(inputFrame) }
+        HookEnvironment.postTracked(inputFrame) { reconcileMiuiBottomFrame(inputFrame) }
     }
 
     private fun reconcileCurrentImeFrame(clazz: Class<*>) {
-        val currentInputFrame = runCatching {
-            clazz.getStaticObject("sBottomViewHelper")
-                ?.getObjectAs<ViewGroup>("mInputFrame")
-        }.getOrNull()
+        val helper = runCatching { clazz.getStaticObject("sBottomViewHelper") }.getOrNull()
+        val currentInputFrame = helper?.getObjectAs<ViewGroup>("mInputFrame")
+        if (currentInputFrame != null && !miuiBottomFrameViews.containsKey(currentInputFrame)) {
+            val fullscreenArea = helper.getObjectAs<ViewGroup>("mFullscreenArea")
+            val rootView = helper.getObjectAs<View>("mRootView")
+            val bottomArea = helper.getObjectAs<View>("mMiuiBottomArea")
+            if (fullscreenArea != null && rootView != null && bottomArea != null) {
+                registerMiuiBottomFrame(fullscreenArea, currentInputFrame, rootView, bottomArea)
+            } else {
+                Log.i("Failed:Rebind current MIUI bottom frame after hot reload")
+            }
+        }
         val inputFrames = currentInputFrame?.let(::listOf)
             ?: miuiBottomFrameViews.keys.toList()
         inputFrames.forEach { inputFrame ->
-            inputFrame.post { reconcileMiuiBottomFrame(inputFrame) }
-            inputFrame.postDelayed({ reconcileMiuiBottomFrame(inputFrame) }, 100L)
+            HookEnvironment.postTracked(inputFrame) { reconcileMiuiBottomFrame(inputFrame) }
+            HookEnvironment.postTracked(inputFrame, 100L) { reconcileMiuiBottomFrame(inputFrame) }
         }
     }
 
@@ -549,8 +724,10 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 val intent = activity.intent ?: return@hookAfter
                 if (!intent.getBooleanExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS, false)) return@hookAfter
                 intent.removeExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS)
-                activity.window?.decorView?.post {
-                    WeTypeHostLauncher.show(activity)
+                activity.window?.decorView?.let { decorView ->
+                    HookEnvironment.postTracked(decorView) {
+                        WeTypeHostLauncher.show(activity)
+                    }
                 }
             }
         }.onFailure {
@@ -565,8 +742,10 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 name == "onResume" && parameterTypes.isEmpty()
             }.hookAfter { param ->
                 val activity = param.thisObject as? Activity ?: return@hookAfter
-                activity.window?.decorView?.post {
-                    hookWeTypeAboutLogoClick(activity)
+                activity.window?.decorView?.let { decorView ->
+                    HookEnvironment.postTracked(decorView) {
+                        hookWeTypeAboutLogoClick(activity)
+                    }
                 }
             }
         }.onFailure {
@@ -582,6 +761,10 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             if (logoView.getTag(WETYPE_ABOUT_LOGO_TAG_KEY) == true) return
 
             val originalClickListener = resolveOnClickListener(logoView)
+            originalAboutLogoStates[logoView] = AboutLogoState(
+                clickListener = originalClickListener,
+                isClickable = logoView.isClickable
+            )
             logoView.isClickable = true
             logoView.setTag(WETYPE_ABOUT_LOGO_TAG_KEY, true)
             logoView.setOnClickListener { view ->
@@ -627,7 +810,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private fun getModuleAssetManager(): AssetManager {
         moduleAssetManager?.let { return it }
         val resolvedModulePath = ModuleRuntime.resolveModuleApkPath()
-            ?: modulePath.takeIf { ::modulePath.isInitialized }
+            ?: modulePath
             ?: error("Module apk path is unavailable")
         val assetManager = AssetManager::class.java.getDeclaredConstructor().newInstance()
         val addAssetPath = assetManagerAddAssetPathMethod ?: AssetManager::class.java.getMethod(
@@ -795,10 +978,10 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     /**
      * Hook InputProvider 的输入法白名单，修复当前输入法无法获取剪贴板的问题
      */
-    private fun startPackageValidationHook(lpparam: XC_LoadPackage.LoadPackageParam) {
+    private fun startPackageValidationHook(sourceDir: String, classLoader: ClassLoader) {
         runCatching {
             System.loadLibrary("dexkit")
-            DexKitBridge.create(lpparam.appInfo.sourceDir).use { bridge ->
+            DexKitBridge.create(sourceDir).use { bridge ->
                 val validationMethod = bridge.findMethod {
                     matcher {
                         declaredClass = MIUI_INPUT_PROVIDER
@@ -811,7 +994,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             "Unexpected error during package validation"
                         )
                     }
-                }.singleOrNull()?.getMethodInstance(lpparam.classLoader) ?: run {
+                }.singleOrNull()?.getMethodInstance(classLoader) ?: run {
                     Log.e("Failed:Locate package validation method in $MIUI_INPUT_PROVIDER")
                     return@use
                 }
@@ -844,4 +1027,250 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private fun classHookToken(hookName: String, clazz: Class<*>): String =
         "${clazz.name}@${System.identityHashCode(clazz.classLoader)}:$hookName"
+
+    private fun ActiveTarget.toBundle(): Bundle = Bundle().apply {
+        putString(STATE_TARGET_KIND, kind)
+        packageName?.let { putString(STATE_PACKAGE_NAME, it) }
+        sourceDir?.let { putString(STATE_SOURCE_DIR, it) }
+    }
+
+    private fun activeTargetsBundle(): Bundle = Bundle().apply {
+        val targets = synchronized(activeTargets) {
+            ArrayList(activeTargets.values.map { target -> target.toBundle() })
+        }
+        putParcelableArrayList(STATE_TARGETS, targets)
+    }
+
+    private fun Bundle?.toActiveTargets(): List<ActiveTarget> {
+        if (this == null) return emptyList()
+        return getParcelableArrayList<Bundle>(STATE_TARGETS)
+            ?.mapNotNull { targetBundle -> targetBundle.toActiveTarget() }
+            .orEmpty()
+    }
+
+    private fun recordActiveTarget(target: ActiveTarget) {
+        synchronized(activeTargets) {
+            recordActiveTargetLocked(target)
+        }
+    }
+
+    private fun recordActiveTargetLocked(target: ActiveTarget) {
+        activeTargets["${target.kind}:${target.packageName.orEmpty()}"] = target
+    }
+
+    private fun Bundle.toActiveTarget(): ActiveTarget? {
+        val kind = getString(STATE_TARGET_KIND) ?: return null
+        if (kind !in setOf(TARGET_KIND_SYSTEM, TARGET_KIND_PACKAGE, TARGET_KIND_PHRASE)) return null
+        return ActiveTarget(
+            kind = kind,
+            packageName = getString(STATE_PACKAGE_NAME),
+            sourceDir = getString(STATE_SOURCE_DIR)
+        )
+    }
+
+    private fun resolveHotReloadClassLoader(
+        target: ActiveTarget,
+        oldHookHandles: List<XposedInterface.HookHandle>
+    ): ClassLoader {
+        if (target.kind == TARGET_KIND_PACKAGE || target.kind == TARGET_KIND_PHRASE) {
+            currentApplicationClassLoader()?.let { return it }
+        }
+        val preferredPrefixes = when (target.kind) {
+            TARGET_KIND_SYSTEM -> listOf("com.android.server.")
+            TARGET_KIND_PHRASE -> listOf(MIUI_INPUT_PROVIDER)
+            TARGET_KIND_PACKAGE -> listOfNotNull(
+                target.packageName,
+                INPUT_METHOD_BOTTOM_MANAGER
+            )
+            else -> emptyList()
+        }
+        oldHookHandles.firstNotNullOfOrNull { handle ->
+            val executable = runCatching { handle.executable }.getOrNull() ?: return@firstNotNullOfOrNull null
+            executable.declaringClass.classLoader?.takeIf {
+                preferredPrefixes.any(executable.declaringClass.name::startsWith)
+            }
+        }?.let { return it }
+
+        Thread.currentThread().contextClassLoader
+            ?.takeUnless { it === MainHook::class.java.classLoader }
+            ?.let { return it }
+        oldHookHandles.firstNotNullOfOrNull { handle ->
+            runCatching { handle.executable.declaringClass.classLoader }.getOrNull()
+        }?.let { return it }
+        return ClassLoader.getSystemClassLoader()
+    }
+
+    private fun currentApplicationClassLoader(): ClassLoader? = runCatching {
+        Class.forName("android.app.ActivityThread")
+            .getDeclaredMethod("currentApplication")
+            .apply { isAccessible = true }
+            .invoke(null)
+            ?.javaClass
+            ?.classLoader
+    }.getOrNull()
+
+    private fun reinstallDynamicBottomManagerHooks(
+        oldHookHandles: List<XposedInterface.HookHandle>,
+        packageName: String
+    ): List<Class<*>> {
+        val isNonCustomize = packageName !in miuiImeList
+        val bottomManagerClasses = oldHookHandles.mapNotNull { handle ->
+            val declaringClass = runCatching { handle.executable.declaringClass }.getOrNull()
+                ?: return@mapNotNull null
+            if (!declaringClass.name.startsWith(INPUT_METHOD_BOTTOM_MANAGER)) return@mapNotNull null
+            declaringClass
+        }.distinctBy { clazz -> System.identityHashCode(clazz.classLoader) }
+        bottomManagerClasses.forEach { bottomManagerClass ->
+            val classLoader = bottomManagerClass.classLoader ?: return@forEach
+            HookEnvironment.withHookScope("miui.dynamic-bottom") {
+                installBottomManagerHooks(classLoader, isNonCustomize)
+            }
+        }
+        return if (isNonCustomize) bottomManagerClasses else emptyList()
+    }
+
+    /**
+     * API 102 hot reload does not replay lifecycle callbacks for already resumed activities.
+     * Reattach only the external view state that the old generation explicitly removed.
+     */
+    private fun reconcileCurrentWeTypeUiAfterHotReload() {
+        val reconciled = runOnMainThreadBlocking {
+            currentProcessActivities().forEach { activity ->
+                if (activity.javaClass.name == WETYPE_ABOUT_ACTIVITY) {
+                    hookWeTypeAboutLogoClick(activity)
+                }
+                val intent = activity.intent ?: return@forEach
+                if (!intent.getBooleanExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS, false)) {
+                    return@forEach
+                }
+                intent.removeExtra(EXTRA_OPEN_WETYPE_EMBEDDED_SETTINGS)
+                WeTypeHostLauncher.show(activity)
+            }
+            currentProcessInputMethodServices().forEach(
+                WeTypeWindowHooks::reconcileCurrentInputMethodService
+            )
+            WeTypeResourceHooks.reconcileCurrentKeyboardLogos(currentProcessWindowViews())
+        }
+        if (!reconciled) {
+            Log.e("Failed:Reconcile current WeType UI after hot reload")
+        }
+    }
+
+    private fun currentProcessWindowViews(): List<View> = runCatching {
+        val windowManagerGlobalClass = Class.forName("android.view.WindowManagerGlobal")
+        val windowManagerGlobal = windowManagerGlobalClass
+            .getDeclaredMethod("getInstance")
+            .apply { isAccessible = true }
+            .invoke(null) ?: return@runCatching emptyList()
+        val views = windowManagerGlobalClass
+            .getDeclaredField("mViews")
+            .apply { isAccessible = true }
+            .get(windowManagerGlobal) as? Collection<*> ?: return@runCatching emptyList()
+        views.filterIsInstance<View>()
+    }.onFailure { error ->
+        Log.e("Failed:Inspect current window views after hot reload")
+        Log.i(error)
+    }.getOrDefault(emptyList())
+
+    private fun currentProcessInputMethodServices(): List<InputMethodService> = runCatching {
+        val activityThreadClass = Class.forName("android.app.ActivityThread")
+        val currentActivityThread = activityThreadClass
+            .getDeclaredMethod("currentActivityThread")
+            .apply { isAccessible = true }
+            .invoke(null) ?: return@runCatching emptyList()
+        val services = activityThreadClass
+            .getDeclaredField("mServices")
+            .apply { isAccessible = true }
+            .get(currentActivityThread) as? Map<*, *> ?: return@runCatching emptyList()
+        services.values.filterIsInstance<InputMethodService>()
+    }.onFailure { error ->
+        Log.e("Failed:Inspect current input method services after hot reload")
+        Log.i(error)
+    }.getOrDefault(emptyList())
+
+    private fun currentProcessActivities(): List<Activity> = runCatching {
+        val activityThreadClass = Class.forName("android.app.ActivityThread")
+        val currentActivityThread = activityThreadClass
+            .getDeclaredMethod("currentActivityThread")
+            .apply { isAccessible = true }
+            .invoke(null) ?: return@runCatching emptyList()
+        val activities = activityThreadClass
+            .getDeclaredField("mActivities")
+            .apply { isAccessible = true }
+            .get(currentActivityThread) as? Map<*, *> ?: return@runCatching emptyList()
+        activities.values.mapNotNull { record ->
+            record ?: return@mapNotNull null
+            runCatching {
+                record.javaClass.getDeclaredField("activity")
+                    .apply { isAccessible = true }
+                    .get(record) as? Activity
+            }.getOrNull()
+        }.filterNot(Activity::isFinishing)
+    }.onFailure { error ->
+        Log.e("Failed:Inspect current activities after hot reload")
+        Log.i(error)
+    }.getOrDefault(emptyList())
+
+    private fun cleanupExternalState(): Boolean = runOnMainThreadBlocking {
+        imeInputFrameLayoutListeners.forEach { (view, listener) ->
+            view.removeOnLayoutChangeListener(listener)
+        }
+        miuiBottomFrameViews.forEach { (inputFrame, frameViews) ->
+            frameViews.first.get()?.let { fullscreenArea ->
+                restoreMiuiBottomFrame(inputFrame, fullscreenArea)
+            }
+        }
+        originalAboutLogoStates.forEach { (view, state) ->
+            view.setOnClickListener(state.clickListener)
+            view.isClickable = state.isClickable
+            view.setTag(WETYPE_ABOUT_LOGO_TAG_KEY, null)
+        }
+
+        imeInputFrameLayoutListeners.clear()
+        monitoredImeInputFrames.clear()
+        originalImeContentBottomPaddings.clear()
+        originalFullscreenAreaHeights.clear()
+        adjustedImeContentViews.clear()
+        miuiBottomFrameViews.clear()
+        originalAboutLogoStates.clear()
+        installedHookTokens.clear()
+        navBarColor = null
+        bottomViewSourceColor = null
+        runCatching { moduleAssetManager?.close() }
+        moduleAssetManager = null
+        moduleResources = null
+        assetManagerAddAssetPathMethod = null
+        viewListenerInfoField = null
+        onClickListenerField = null
+    }
+
+    private fun runOnMainThreadBlocking(block: () -> Unit): Boolean {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return runCatching(block).onFailure {
+                Log.e("Failed:Cleanup main hook state for hot reload")
+                Log.i(it)
+            }.isSuccess
+        }
+
+        val completed = CountDownLatch(1)
+        var failure: Throwable? = null
+        if (!Handler(Looper.getMainLooper()).post {
+                try {
+                    block()
+                } catch (error: Throwable) {
+                    failure = error
+                } finally {
+                    completed.countDown()
+                }
+            }
+        ) {
+            return false
+        }
+        val finished = runCatching { completed.await(2, TimeUnit.SECONDS) }.getOrDefault(false)
+        failure?.let {
+            Log.e("Failed:Cleanup main hook state for hot reload")
+            Log.i(it)
+        }
+        return finished && failure == null
+    }
 }

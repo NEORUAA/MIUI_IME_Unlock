@@ -16,6 +16,7 @@
     <string name="settings_reset">恢复默认</string>
     <string name="settings_restart">重启 WeType</string>
     <string name="settings_saved">设置已保存, 重启输入法进程以生效</string>
+    <string name="settings_save_failed">设置保存失败</string>
     <string name="settings_invalid_color">颜色格式不正确，请使用 #RRGGBB。</string>
     <string name="settings_root_required">请先授予 root 权限</string>
     <string name="settings_restart_done">WeType 已重启</string>

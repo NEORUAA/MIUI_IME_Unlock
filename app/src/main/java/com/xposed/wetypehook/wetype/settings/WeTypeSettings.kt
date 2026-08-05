@@ -1,14 +1,30 @@
 package com.xposed.wetypehook.wetype.settings
 
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.graphics.Color
-import de.robv.android.xposed.XSharedPreferences
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import com.xposed.wetypehook.ModuleBridgeContract
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.UUID
 
 object WeTypeSettings {
+    const val PREF_GROUP = "wetype_settings"
     private const val MODULE_PACKAGE_NAME = "com.xposed.wetypehook"
-    private const val PREF_NAME = "wetype_settings"
+    private const val WETYPE_PACKAGE_NAME = "com.tencent.wetype"
+    private const val EXTRA_APPEARANCE_COLORS = "appearance_colors"
+    private const val KEY_REMOTE_SYNC_PENDING = "remote_sync_pending"
+    private const val KEY_HOST_SYNC_PENDING = "host_sync_pending"
+    private const val KEY_HOST_SYNC_REVISION = "host_sync_revision"
+    private const val KEY_LAST_IMPORTED_REVISION = "last_imported_revision"
     private const val KEY_LIGHT_COLOR = "light_color"
     private const val KEY_DARK_COLOR = "dark_color"
     private const val KEY_BLUR_RADIUS = "blur_radius"
@@ -49,21 +65,20 @@ object WeTypeSettings {
         DARK_KEY_COLOR_GROUP_ID to 0xFF707070.toInt()
     )
 
-    private val xposedPrefsLock = Any()
-    private val xposedPrefsCache = HashMap<String, XSharedPreferences>()
+    private val remotePrefsLock = Any()
+    private val settingsSyncLock = Any()
 
     @Volatile
     private var cachedXposedSnapshot: Snapshot? = null
-    @Volatile
-    private var xposedPrefsPackageName: String = MODULE_PACKAGE_NAME
 
-    private val xposedPrefChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+    @Volatile
+    private var remotePreferences: SharedPreferences? = null
+
+    @Volatile
+    private var moduleBridgePendingIntent: PendingIntent? = null
+
+    private val remotePrefChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
         cachedXposedSnapshot = null
-        synchronized(xposedPrefsLock) {
-            xposedPrefsCache.values.forEach { prefs ->
-                runCatching { prefs.reload() }
-            }
-        }
     }
 
     data class Snapshot(
@@ -113,44 +128,146 @@ object WeTypeSettings {
 
     fun isDisableHotUpdate(context: Context): Boolean = readSnapshot(context).disableHotUpdate
 
-    fun initXposed() {
-        cachedXposedSnapshot = null
-        synchronized(xposedPrefsLock) {
-            xposedPrefsCache[xposedPrefsPackageName]?.reload()
-            xposedPrefsCache[MODULE_PACKAGE_NAME]?.reload()
+    fun bindRemotePreferences(preferences: SharedPreferences) {
+        synchronized(remotePrefsLock) {
+            if (remotePreferences === preferences) return
+            remotePreferences?.let { previous ->
+                runCatching {
+                    previous.unregisterOnSharedPreferenceChangeListener(remotePrefChangeListener)
+                }
+            }
+            remotePreferences = preferences
+            runCatching {
+                preferences.registerOnSharedPreferenceChangeListener(remotePrefChangeListener)
+            }
         }
+        cachedXposedSnapshot = null
     }
 
-    fun configureStorage(hostPackageName: String) {
-        if (hostPackageName.isBlank() || xposedPrefsPackageName == hostPackageName) return
-        synchronized(xposedPrefsLock) {
-            if (xposedPrefsPackageName == hostPackageName) return
-            xposedPrefsPackageName = hostPackageName
+    fun unbindRemotePreferences() {
+        synchronized(remotePrefsLock) {
+            remotePreferences?.let { preferences ->
+                runCatching {
+                    preferences.unregisterOnSharedPreferenceChangeListener(remotePrefChangeListener)
+                }
+            }
+            remotePreferences = null
         }
         cachedXposedSnapshot = null
+    }
+
+    fun prepareForHotReload() = unbindRemotePreferences()
+
+    fun bindModuleBridgePendingIntent(pendingIntent: PendingIntent?) {
+        moduleBridgePendingIntent = pendingIntent
     }
 
     fun ensureHostSnapshot(context: Context) {
-        val prefs = appPreferences(context)
-        if (prefs.containsAnyPersistedSetting()) return
-        val snapshot = readSnapshotXposed()
-        saveDirect(
-            context = context,
-            lightColor = snapshot.lightColor,
-            darkColor = snapshot.darkColor,
-            blurRadius = snapshot.blurRadius,
-            cornerRadius = snapshot.cornerRadius,
-            keyCornerRadius = snapshot.keyCornerRadius,
-            edgeHighlightEnabled = snapshot.edgeHighlightEnabled,
-            edgeHighlightIntensity = snapshot.edgeHighlightIntensity,
-            candidateBackgroundAlpha = snapshot.candidateBackgroundAlpha,
-            candidateBackgroundCorner = snapshot.candidateBackgroundCorner,
-            candidateBackgroundLeftMarginDp = snapshot.candidateBackgroundLeftMarginDp,
-            candidatePinyinLeftMarginDp = snapshot.candidatePinyinLeftMarginDp,
-            toolbarIconBgOpacity = snapshot.toolbarIconBgOpacity,
-            appearanceColors = snapshot.appearanceColors,
-            disableHotUpdate = snapshot.disableHotUpdate
-        )
+        val appContext = context.applicationContext ?: context
+        val localPreferences = appPreferences(appContext)
+        val localSnapshot = localPreferences.toSnapshotOrNull()
+        if (appContext.packageName == MODULE_PACKAGE_NAME) {
+            synchronizeRemotePreferences(appContext)
+            return
+        }
+        val remoteSnapshot = remotePreferences?.toSnapshotOrNull()
+        val hostSyncPending = localPreferences.getBoolean(KEY_HOST_SYNC_PENDING, false)
+
+        when {
+            hostSyncPending && localSnapshot != null -> {
+                cachedXposedSnapshot = localSnapshot
+                val revision = localPreferences.getLong(KEY_HOST_SYNC_REVISION, 0L)
+                sendSnapshotToModule(appContext, localSnapshot, revision) { accepted ->
+                    acknowledgeHostSnapshot(appContext, revision, accepted)
+                }
+            }
+
+            remoteSnapshot != null -> {
+                writeSnapshot(localPreferences, remoteSnapshot)
+                cachedXposedSnapshot = remoteSnapshot
+            }
+
+            localSnapshot != null -> {
+                cachedXposedSnapshot = localSnapshot
+                val revision = nextHostRevision(localPreferences)
+                val staged = localPreferences.edit()
+                    .putBoolean(KEY_HOST_SYNC_PENDING, true)
+                    .putLong(KEY_HOST_SYNC_REVISION, revision)
+                    .commit()
+                if (staged) {
+                    sendSnapshotToModule(appContext, localSnapshot, revision) { accepted ->
+                        acknowledgeHostSnapshot(appContext, revision, accepted)
+                    }
+                }
+            }
+        }
+    }
+
+    fun synchronizeRemotePreferences(context: Context) {
+        val appContext = context.applicationContext ?: context
+        if (appContext.packageName != MODULE_PACKAGE_NAME) return
+        synchronized(settingsSyncLock) {
+            synchronizeRemotePreferencesLocked(appContext)
+        }
+    }
+
+    private fun synchronizeRemotePreferencesLocked(context: Context) {
+        val remote = remotePreferences ?: return
+        val localPreferences = appPreferences(context)
+        val localSnapshot = localPreferences.toSnapshotOrNull()
+        val remoteSnapshot = remote.toSnapshotOrNull()
+        val pending = localPreferences.getBoolean(KEY_REMOTE_SYNC_PENDING, false)
+        when {
+            pending && localSnapshot != null -> {
+                val synced = runCatching { writeSnapshot(remote, localSnapshot) }
+                    .getOrDefault(false)
+                if (synced) {
+                    localPreferences.edit().putBoolean(KEY_REMOTE_SYNC_PENDING, false).commit()
+                }
+                if (synced) cachedXposedSnapshot = localSnapshot
+            }
+
+            remoteSnapshot == null && localSnapshot != null -> {
+                val synced = runCatching { writeSnapshot(remote, localSnapshot) }
+                    .getOrDefault(false)
+                if (synced) {
+                    localPreferences.edit().putBoolean(KEY_REMOTE_SYNC_PENDING, false).commit()
+                }
+                if (synced) cachedXposedSnapshot = localSnapshot
+            }
+
+            remoteSnapshot != null -> {
+                val mirrored = writeSnapshot(localPreferences, remoteSnapshot) { editor ->
+                    editor.putBoolean(KEY_REMOTE_SYNC_PENDING, false)
+                }
+                if (mirrored) cachedXposedSnapshot = remoteSnapshot
+            }
+        }
+    }
+
+    fun importBridgedSettings(context: Context, settings: Bundle): Boolean {
+        val appContext = context.applicationContext ?: context
+        if (appContext.packageName != MODULE_PACKAGE_NAME) {
+            return false
+        }
+        return synchronized(settingsSyncLock) {
+            val snapshot = settings.toSnapshot()
+            val revision = settings.getLong(ModuleBridgeContract.EXTRA_REVISION, 0L)
+            val localPreferences = appPreferences(appContext)
+            val lastImportedRevision = localPreferences.getLong(KEY_LAST_IMPORTED_REVISION, 0L)
+            if (revision > 0L && revision < lastImportedRevision) {
+                return@synchronized true
+            }
+            val staged = writeSnapshot(localPreferences, snapshot) { editor ->
+                editor
+                    .putBoolean(KEY_REMOTE_SYNC_PENDING, true)
+                    .putLong(KEY_LAST_IMPORTED_REVISION, revision)
+            }
+            if (!staged) return@synchronized false
+            cachedXposedSnapshot = snapshot
+            synchronizeRemotePreferencesLocked(appContext)
+            true
+        }
     }
 
     fun save(
@@ -168,12 +285,13 @@ object WeTypeSettings {
         candidatePinyinLeftMarginDp: Int,
         toolbarIconBgOpacity: Int,
         appearanceColors: Map<String, Int>,
-        disableHotUpdate: Boolean = DEFAULT_DISABLE_HOT_UPDATE
-    ) {
+        disableHotUpdate: Boolean = DEFAULT_DISABLE_HOT_UPDATE,
+        onPersisted: (Boolean) -> Unit = {}
+    ): Boolean {
         val sanitizedAppearanceColors = WeTypeAppearanceColorGroups.groups.associate { group ->
             group.id to (appearanceColors[group.id] ?: group.defaultColor)
         }
-        saveDirect(
+        return saveDirect(
             context = context,
             lightColor = lightColor,
             darkColor = darkColor,
@@ -188,7 +306,8 @@ object WeTypeSettings {
             candidatePinyinLeftMarginDp = candidatePinyinLeftMarginDp,
             toolbarIconBgOpacity = toolbarIconBgOpacity,
             appearanceColors = sanitizedAppearanceColors,
-            disableHotUpdate = disableHotUpdate
+            disableHotUpdate = disableHotUpdate,
+            onPersisted = onPersisted
         )
     }
 
@@ -237,39 +356,26 @@ object WeTypeSettings {
     fun getAppearanceColorsXposed(): Map<String, Int> = readSnapshotXposed().appearanceColors
 
     fun readSnapshot(context: Context): Snapshot {
-        val prefs = appPreferences(context)
-        return prefs.toSnapshotOrNull() ?: readSnapshotXposed()
+        return remotePreferences?.toSnapshotOrNull()
+            ?: appPreferences(context).toSnapshotOrNull()
+            ?: defaultSnapshot()
     }
 
     private fun readSnapshotXposed(): Snapshot {
         cachedXposedSnapshot?.let { return it }
 
-        synchronized(xposedPrefsLock) {
+        synchronized(remotePrefsLock) {
             cachedXposedSnapshot?.let { return it }
-
-            val hostPrefs = getXposedPrefsLocked(xposedPrefsPackageName)
-            val modulePrefs = if (xposedPrefsPackageName == MODULE_PACKAGE_NAME) {
-                hostPrefs
-            } else {
-                getXposedPrefsLocked(MODULE_PACKAGE_NAME)
-            }
-
-            val resolvedSnapshot = hostPrefs.loadSnapshotOrNull()
-                ?: modulePrefs.loadSnapshotOrNull()
+            val resolvedSnapshot = remotePreferences?.toSnapshotOrNull()
                 ?: defaultSnapshot()
             cachedXposedSnapshot = resolvedSnapshot
             return resolvedSnapshot
         }
     }
 
-    @Suppress("DEPRECATION")
     private fun appPreferences(context: Context): SharedPreferences {
         val appContext = context.applicationContext ?: context
-        return try {
-            appContext.getSharedPreferences(PREF_NAME, Context.MODE_WORLD_READABLE)
-        } catch (_: SecurityException) {
-            appContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        }
+        return appContext.getSharedPreferences(PREF_GROUP, Context.MODE_PRIVATE)
     }
 
     private fun saveDirect(
@@ -287,48 +393,10 @@ object WeTypeSettings {
         candidatePinyinLeftMarginDp: Int,
         toolbarIconBgOpacity: Int,
         appearanceColors: Map<String, Int>,
-        disableHotUpdate: Boolean
-    ) {
-        val editor = appPreferences(context)
-            .edit()
-            .putInt(KEY_LIGHT_COLOR, lightColor)
-            .putInt(KEY_DARK_COLOR, darkColor)
-            .putInt(KEY_BLUR_RADIUS, blurRadius.coerceIn(0, 100))
-            .putInt(KEY_CORNER_RADIUS, cornerRadius.coerceIn(0, MAX_CORNER_RADIUS))
-            .putInt(KEY_KEY_CORNER_RADIUS, keyCornerRadius.coerceIn(0, MAX_KEY_CORNER_RADIUS))
-            .putBoolean(KEY_EDGE_HIGHLIGHT_ENABLED, edgeHighlightEnabled)
-            .putInt(KEY_EDGE_HIGHLIGHT_INTENSITY, edgeHighlightIntensity.coerceIn(0, 200))
-            .putInt(
-                KEY_CANDIDATE_BACKGROUND_ALPHA,
-                candidateBackgroundAlpha.coerceIn(0, 255)
-            )
-            .putFloat(
-                KEY_CANDIDATE_BACKGROUND_CORNER,
-                candidateBackgroundCorner.coerceIn(0f, MAX_CANDIDATE_BACKGROUND_CORNER.toFloat())
-            )
-            .putInt(
-                KEY_CANDIDATE_BACKGROUND_LEFT_MARGIN_DP,
-                candidateBackgroundLeftMarginDp.coerceIn(0, 64)
-            )
-            .putInt(
-                KEY_CANDIDATE_PINYIN_LEFT_MARGIN_DP,
-                candidatePinyinLeftMarginDp.coerceIn(0, 64)
-            )
-            .putInt(KEY_TOOLBAR_ICON_BG_OPACITY, toolbarIconBgOpacity.coerceIn(0, 255))
-            .putBoolean(KEY_DISABLE_HOT_UPDATE, disableHotUpdate)
-            .putBoolean(KEY_KEY_OPACITY_MIGRATED, true)
-            .remove(KEY_KEY_OPACITY)
-        WeTypeAppearanceColorGroups.groups.forEach { group ->
-            editor.putInt(
-                "$KEY_APPEARANCE_COLOR_PREFIX${group.id}",
-                appearanceColors[group.id] ?: group.defaultColor
-            )
-        }
-        WeTypeAppearanceColorGroups.obsoleteGroupIds.forEach { groupId ->
-            editor.remove("$KEY_APPEARANCE_COLOR_PREFIX$groupId")
-        }
-        editor.commit()
-        cachedXposedSnapshot = Snapshot(
+        disableHotUpdate: Boolean,
+        onPersisted: (Boolean) -> Unit
+    ): Boolean {
+        val snapshot = Snapshot(
             lightColor = lightColor,
             darkColor = darkColor,
             blurRadius = blurRadius.coerceIn(0, 100),
@@ -349,34 +417,247 @@ object WeTypeSettings {
             },
             disableHotUpdate = disableHotUpdate
         )
-        synchronized(xposedPrefsLock) {
-            xposedPrefsCache.values.forEach { prefs ->
-                runCatching { prefs.reload() }
+        val appContext = context.applicationContext ?: context
+        val localPreferences = appPreferences(appContext)
+        return if (appContext.packageName == MODULE_PACKAGE_NAME) {
+            val persisted = synchronized(settingsSyncLock) {
+                val synced = remotePreferences?.let { preferences ->
+                    runCatching { writeSnapshot(preferences, snapshot) }.getOrDefault(false)
+                } ?: false
+                writeSnapshot(localPreferences, snapshot) { editor ->
+                    editor.putBoolean(KEY_REMOTE_SYNC_PENDING, !synced)
+                }.also { saved ->
+                    if (saved) cachedXposedSnapshot = snapshot
+                }
+            }
+            onPersisted(persisted)
+            persisted
+        } else {
+            val revision = nextHostRevision(localPreferences)
+            val staged = writeSnapshot(localPreferences, snapshot) { editor ->
+                editor
+                    .putBoolean(KEY_HOST_SYNC_PENDING, true)
+                    .putLong(KEY_HOST_SYNC_REVISION, revision)
+            }
+            if (!staged) {
+                onPersisted(false)
+                return false
+            }
+            cachedXposedSnapshot = snapshot
+            sendSnapshotToModule(appContext, snapshot, revision) { accepted ->
+                acknowledgeHostSnapshot(appContext, revision, accepted)
+                onPersisted(accepted)
             }
         }
     }
 
-    @Suppress("DEPRECATION")
-    private fun getXposedPrefs(packageName: String): XSharedPreferences? {
-        synchronized(xposedPrefsLock) {
-            return getXposedPrefsLocked(packageName)
+    private fun writeSnapshot(
+        preferences: SharedPreferences,
+        snapshot: Snapshot,
+        configureEditor: (SharedPreferences.Editor) -> Unit = {}
+    ): Boolean {
+        val editor = preferences.edit()
+            .putInt(KEY_LIGHT_COLOR, snapshot.lightColor)
+            .putInt(KEY_DARK_COLOR, snapshot.darkColor)
+            .putInt(KEY_BLUR_RADIUS, snapshot.blurRadius)
+            .putInt(KEY_CORNER_RADIUS, snapshot.cornerRadius)
+            .putInt(KEY_KEY_CORNER_RADIUS, snapshot.keyCornerRadius)
+            .putBoolean(KEY_EDGE_HIGHLIGHT_ENABLED, snapshot.edgeHighlightEnabled)
+            .putInt(KEY_EDGE_HIGHLIGHT_INTENSITY, snapshot.edgeHighlightIntensity)
+            .putInt(KEY_CANDIDATE_BACKGROUND_ALPHA, snapshot.candidateBackgroundAlpha)
+            .putFloat(KEY_CANDIDATE_BACKGROUND_CORNER, snapshot.candidateBackgroundCorner)
+            .putInt(
+                KEY_CANDIDATE_BACKGROUND_LEFT_MARGIN_DP,
+                snapshot.candidateBackgroundLeftMarginDp
+            )
+            .putInt(
+                KEY_CANDIDATE_PINYIN_LEFT_MARGIN_DP,
+                snapshot.candidatePinyinLeftMarginDp
+            )
+            .putInt(KEY_TOOLBAR_ICON_BG_OPACITY, snapshot.toolbarIconBgOpacity)
+            .putBoolean(KEY_DISABLE_HOT_UPDATE, snapshot.disableHotUpdate)
+            .putBoolean(KEY_KEY_OPACITY_MIGRATED, true)
+            .remove(KEY_KEY_OPACITY)
+        WeTypeAppearanceColorGroups.groups.forEach { group ->
+            editor.putInt(
+                "$KEY_APPEARANCE_COLOR_PREFIX${group.id}",
+                snapshot.appearanceColors[group.id] ?: group.defaultColor
+            )
         }
+        WeTypeAppearanceColorGroups.obsoleteGroupIds.forEach { groupId ->
+            editor.remove("$KEY_APPEARANCE_COLOR_PREFIX$groupId")
+        }
+        configureEditor(editor)
+        return editor.commit()
     }
 
-    @Suppress("DEPRECATION")
-    private fun getXposedPrefsLocked(packageName: String): XSharedPreferences? {
-        xposedPrefsCache[packageName]?.let { return it }
-        val prefs = runCatching {
-            XSharedPreferences(packageName, PREF_NAME).also { createdPrefs ->
-                createdPrefs.reload()
-            }
-        }.getOrNull() ?: return null
-
-        xposedPrefsCache[packageName] = prefs
-        runCatching {
-            prefs.registerOnSharedPreferenceChangeListener(xposedPrefChangeListener)
+    private fun sendSnapshotToModule(
+        context: Context,
+        snapshot: Snapshot,
+        revision: Long,
+        onAccepted: (Boolean) -> Unit
+    ): Boolean {
+        if (context.packageName != WETYPE_PACKAGE_NAME) {
+            onAccepted(false)
+            return false
         }
-        return prefs
+        val appContext = context.applicationContext ?: context
+        val acknowledgementAction = "${ModuleBridgeContract.ACTION_ACK_PREFIX}.${UUID.randomUUID()}"
+        val acknowledgementToken = UUID.randomUUID().toString()
+        val intent = ModuleBridgeContract.explicitBridgeIntent()
+            .putExtra(ModuleBridgeContract.EXTRA_MESSAGE_TYPE, ModuleBridgeContract.MESSAGE_SAVE_SETTINGS)
+            .putExtra(ModuleBridgeContract.EXTRA_SETTINGS, snapshot.toBundle())
+            .putExtra(ModuleBridgeContract.EXTRA_REVISION, revision)
+            .putExtra(ModuleBridgeContract.EXTRA_ACK_ACTION, acknowledgementAction)
+            .putExtra(ModuleBridgeContract.EXTRA_ACK_TOKEN, acknowledgementToken)
+        val mainHandler = Handler(Looper.getMainLooper())
+        val finished = AtomicBoolean(false)
+        var registered = false
+        lateinit var acknowledgementReceiver: BroadcastReceiver
+
+        fun finish(accepted: Boolean) {
+            if (!finished.compareAndSet(false, true)) return
+            mainHandler.removeCallbacksAndMessages(null)
+            if (registered) runCatching { appContext.unregisterReceiver(acknowledgementReceiver) }
+            onAccepted(accepted)
+        }
+
+        acknowledgementReceiver = object : BroadcastReceiver() {
+            override fun onReceive(receiverContext: Context, acknowledgement: Intent) {
+                if (acknowledgement.action != acknowledgementAction ||
+                    acknowledgement.getStringExtra(ModuleBridgeContract.EXTRA_ACK_TOKEN) !=
+                    acknowledgementToken ||
+                    acknowledgement.getLongExtra(
+                        ModuleBridgeContract.EXTRA_REVISION,
+                        Long.MIN_VALUE
+                    ) != revision
+                ) {
+                    return
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+                    receiverContext.packageManager.getPackagesForUid(sentFromUid)
+                        ?.contains(MODULE_PACKAGE_NAME) != true
+                ) {
+                    finish(false)
+                    return
+                }
+                finish(
+                    acknowledgement.getIntExtra(ModuleBridgeContract.EXTRA_RESULT, 0) ==
+                        ModuleBridgeContract.RESULT_ACCEPTED
+                )
+            }
+        }
+        val didRegister = runCatching {
+            val filter = IntentFilter(acknowledgementAction)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                appContext.registerReceiver(
+                    acknowledgementReceiver,
+                    filter,
+                    Context.RECEIVER_EXPORTED
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                appContext.registerReceiver(acknowledgementReceiver, filter)
+            }
+            true
+        }.getOrDefault(false)
+        registered = didRegister
+        val sentViaPendingIntent = moduleBridgePendingIntent?.let { pendingIntent ->
+            runCatching {
+                pendingIntent.send(appContext, 0, intent)
+            }.onFailure {
+                moduleBridgePendingIntent = null
+            }.isSuccess
+        } == true
+        if (!didRegister ||
+            (!sentViaPendingIntent && !ModuleBridgeContract.sendWithIdentity(appContext, intent))
+        ) {
+            finish(false)
+            return false
+        }
+        mainHandler.postDelayed({ finish(false) }, ModuleBridgeContract.ACK_TIMEOUT_MILLIS)
+        return true
+    }
+
+    private fun acknowledgeHostSnapshot(context: Context, revision: Long, accepted: Boolean) {
+        if (!accepted) return
+        val preferences = appPreferences(context)
+        if (preferences.getLong(KEY_HOST_SYNC_REVISION, Long.MIN_VALUE) != revision) return
+        preferences.edit().putBoolean(KEY_HOST_SYNC_PENDING, false).commit()
+    }
+
+    private fun nextHostRevision(preferences: SharedPreferences): Long {
+        val previous = preferences.getLong(KEY_HOST_SYNC_REVISION, 0L)
+        return maxOf(System.currentTimeMillis(), previous + 1L)
+    }
+
+    private fun Snapshot.toBundle(): Bundle = Bundle().apply {
+        putInt(KEY_LIGHT_COLOR, lightColor)
+        putInt(KEY_DARK_COLOR, darkColor)
+        putInt(KEY_BLUR_RADIUS, blurRadius)
+        putInt(KEY_CORNER_RADIUS, cornerRadius)
+        putInt(KEY_KEY_CORNER_RADIUS, keyCornerRadius)
+        putBoolean(KEY_EDGE_HIGHLIGHT_ENABLED, edgeHighlightEnabled)
+        putInt(KEY_EDGE_HIGHLIGHT_INTENSITY, edgeHighlightIntensity)
+        putInt(KEY_CANDIDATE_BACKGROUND_ALPHA, candidateBackgroundAlpha)
+        putFloat(KEY_CANDIDATE_BACKGROUND_CORNER, candidateBackgroundCorner)
+        putInt(KEY_CANDIDATE_BACKGROUND_LEFT_MARGIN_DP, candidateBackgroundLeftMarginDp)
+        putInt(KEY_CANDIDATE_PINYIN_LEFT_MARGIN_DP, candidatePinyinLeftMarginDp)
+        putInt(KEY_TOOLBAR_ICON_BG_OPACITY, toolbarIconBgOpacity)
+        putBoolean(KEY_DISABLE_HOT_UPDATE, disableHotUpdate)
+        putBundle(
+            EXTRA_APPEARANCE_COLORS,
+            Bundle().apply {
+                appearanceColors.forEach { (groupId, color) -> putInt(groupId, color) }
+            }
+        )
+    }
+
+    private fun Bundle.toSnapshot(): Snapshot {
+        val defaults = defaultSnapshot()
+        val appearanceBundle = getBundle(EXTRA_APPEARANCE_COLORS)
+        return Snapshot(
+            lightColor = getInt(KEY_LIGHT_COLOR, defaults.lightColor),
+            darkColor = getInt(KEY_DARK_COLOR, defaults.darkColor),
+            blurRadius = getInt(KEY_BLUR_RADIUS, defaults.blurRadius).coerceIn(0, 100),
+            cornerRadius = getInt(KEY_CORNER_RADIUS, defaults.cornerRadius)
+                .coerceIn(0, MAX_CORNER_RADIUS),
+            keyCornerRadius = getInt(KEY_KEY_CORNER_RADIUS, defaults.keyCornerRadius)
+                .coerceIn(0, MAX_KEY_CORNER_RADIUS),
+            edgeHighlightEnabled = getBoolean(
+                KEY_EDGE_HIGHLIGHT_ENABLED,
+                defaults.edgeHighlightEnabled
+            ),
+            edgeHighlightIntensity = getInt(
+                KEY_EDGE_HIGHLIGHT_INTENSITY,
+                defaults.edgeHighlightIntensity
+            ).coerceIn(0, 200),
+            candidateBackgroundAlpha = getInt(
+                KEY_CANDIDATE_BACKGROUND_ALPHA,
+                defaults.candidateBackgroundAlpha
+            ).coerceIn(0, 255),
+            candidateBackgroundCorner = getFloat(
+                KEY_CANDIDATE_BACKGROUND_CORNER,
+                defaults.candidateBackgroundCorner
+            ).coerceIn(0f, MAX_CANDIDATE_BACKGROUND_CORNER.toFloat()),
+            candidateBackgroundLeftMarginDp = getInt(
+                KEY_CANDIDATE_BACKGROUND_LEFT_MARGIN_DP,
+                defaults.candidateBackgroundLeftMarginDp
+            ).coerceIn(0, 64),
+            candidatePinyinLeftMarginDp = getInt(
+                KEY_CANDIDATE_PINYIN_LEFT_MARGIN_DP,
+                defaults.candidatePinyinLeftMarginDp
+            ).coerceIn(0, 64),
+            appearanceColors = WeTypeAppearanceColorGroups.groups.associate { group ->
+                group.id to (appearanceBundle?.getInt(group.id, group.defaultColor)
+                    ?: group.defaultColor)
+            },
+            toolbarIconBgOpacity = getInt(
+                KEY_TOOLBAR_ICON_BG_OPACITY,
+                defaults.toolbarIconBgOpacity
+            ).coerceIn(0, 255),
+            disableHotUpdate = getBoolean(KEY_DISABLE_HOT_UPDATE, defaults.disableHotUpdate)
+        )
     }
 
     private fun SharedPreferences.toSnapshot(): Snapshot {
@@ -490,9 +771,4 @@ object WeTypeSettings {
         }
     }
 
-    private fun XSharedPreferences?.loadSnapshotOrNull(): Snapshot? {
-        this ?: return null
-        runCatching { reload() }
-        return toSnapshotOrNull()
-    }
 }
