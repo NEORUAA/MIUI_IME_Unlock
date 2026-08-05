@@ -10,13 +10,13 @@ HyperOS 3.0.315.2 Beta
 
 Android 16
 
-LSPosed v2.1.0 (7769)
+LSPosed v2.1.1 (7790)
 
-微信输入法：3.5.2.54204
+微信输入法：3.5.2.55201
 
 ## 使用方法
 
-Xposed API Version >= 93
+Xposed API Version >= 102
 
 在作用域勾选需要解除限制的输入法即可，小米定制版也要勾上
 
@@ -41,6 +41,7 @@ Xposed API Version >= 93
 
 v1.27
 
+    重构至 libxposed API 102
     同步上游：Hook 小米短语 InputProvider 的包名校验，修复当前输入法无法获取剪贴板列表的问题
     作用域新增 com.miui.phrase
 
