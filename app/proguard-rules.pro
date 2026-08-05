@@ -26,6 +26,9 @@
     <init>();
 }
 
+# DexKit 通过 JNI 回调这些类型，混淆后 native 层无法解析
+-keep class org.luckypray.dexkit.** { *; }
+
 -dontwarn androidx.window.extensions.area.ExtensionWindowAreaPresentation
 -dontwarn androidx.window.extensions.core.util.function.Consumer
 -dontwarn androidx.window.extensions.core.util.function.Function

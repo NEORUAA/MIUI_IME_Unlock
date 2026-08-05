@@ -6,6 +6,7 @@ import android.content.res.Configuration
 import android.content.res.Resources
 import android.graphics.Color
 import android.inputmethodservice.InputMethodService
+import android.os.Binder
 import android.provider.Settings
 import android.view.LayoutInflater
 import android.view.View
@@ -34,6 +35,7 @@ import dalvik.system.BaseDexClassLoader
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import org.luckypray.dexkit.DexKitBridge
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -44,6 +46,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG = "miuiime"
 private const val WETYPE_PACKAGE = "com.tencent.wetype"
+private const val MIUI_PHRASE_PACKAGE = "com.miui.phrase"
+private const val MIUI_INPUT_PROVIDER = "com.miui.provider.InputProvider"
 private const val INPUT_METHOD_BOTTOM_MANAGER = "com.miui.inputmethod.InputMethodBottomManager"
 private const val WETYPE_ABOUT_ACTIVITY = "com.tencent.wetype.plugin.hld.ui.ImeAboutActivity"
 private const val WETYPE_ABOUT_LOGO_TAG_KEY = 0x4D495549
@@ -106,6 +110,10 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         if (lpparam.packageName == "android") {
             if (isMiuiImeSupport) {
                 startPermissionHook()
+            }
+        } else if (lpparam.packageName == MIUI_PHRASE_PACKAGE) {
+            if (isMiuiImeSupport) {
+                startPackageValidationHook(lpparam)
             }
         } else {
             startHook(lpparam, isMiuiImeSupport)
@@ -780,6 +788,56 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             }
         }.onFailure {
             Log.i("Failed: Hook method isCallingBetweenCustomIME")
+            Log.i(it)
+        }
+    }
+
+    /**
+     * Hook InputProvider 的输入法白名单，修复当前输入法无法获取剪贴板的问题
+     */
+    private fun startPackageValidationHook(lpparam: XC_LoadPackage.LoadPackageParam) {
+        runCatching {
+            System.loadLibrary("dexkit")
+            DexKitBridge.create(lpparam.appInfo.sourceDir).use { bridge ->
+                val validationMethod = bridge.findMethod {
+                    matcher {
+                        declaredClass = MIUI_INPUT_PROVIDER
+                        returnType = "boolean"
+                        usingStrings(
+                            "InputProvider",
+                            "Invalid caller UID: ",
+                            "No package name for UID: ",
+                            "Package validation failed: ",
+                            "Unexpected error during package validation"
+                        )
+                    }
+                }.singleOrNull()?.getMethodInstance(lpparam.classLoader) ?: run {
+                    Log.e("Failed:Locate package validation method in $MIUI_INPUT_PROVIDER")
+                    return@use
+                }
+                validationMethod.hookBefore { param ->
+                    runCatching {
+                        val provider = param.thisObject ?: return@runCatching
+                        val context = provider.invokeMethodAs<Context>("getContext")
+                            ?: return@runCatching
+                        val currentInputMethodPackageName = Settings.Secure.getString(
+                            context.contentResolver,
+                            Settings.Secure.DEFAULT_INPUT_METHOD
+                        )?.substringBefore('/') ?: return@runCatching
+                        val packagesForUid = context.packageManager
+                            .getPackagesForUid(Binder.getCallingUid()) ?: return@runCatching
+                        if (packagesForUid.contains(currentInputMethodPackageName)) {
+                            param.result = true
+                        }
+                    }.onFailure {
+                        Log.i("Failed:Validate calling package for clipboard access")
+                        Log.i(it)
+                    }
+                }
+                Log.i("Success:Hook package validation")
+            }
+        }.onFailure {
+            Log.e("Failed:Hook package validation")
             Log.i(it)
         }
     }

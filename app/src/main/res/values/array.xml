@@ -3,7 +3,7 @@
     <string-array name="HookList">
         <item>android</item>
 <!--        <item>com.android.settings</item>-->
-<!--        <item>com.miui.phrase</item>-->
+        <item>com.miui.phrase</item>
         <item>com.iflytek.inputmethod.miui</item>
         <item>com.sohu.inputmethod.sogou.xiaomi</item>
         <item>com.baidu.input_mi</item>

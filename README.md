@@ -39,6 +39,11 @@ Xposed API Version >= 93
 
 ## 更新日志
 
+v1.27
+
+    同步上游：Hook 小米短语 InputProvider 的包名校验，修复当前输入法无法获取剪贴板列表的问题
+    作用域新增 com.miui.phrase
+
 v1.26
 
     修复键盘左上角 logo 资源 Hook 的泛用性，适配新版混淆资源名变化

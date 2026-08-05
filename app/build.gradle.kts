@@ -13,8 +13,8 @@ android {
         applicationId = "com.xposed.wetypehook"
         minSdk = 31
         targetSdk = 37
-        versionCode = 31
-        versionName = "1.26.3"
+        versionCode = 32
+        versionName = "1.27"
     }
 
     buildTypes {
@@ -69,4 +69,5 @@ dependencies {
         exclude(group = "top.yukonga.miuix.kmp", module = "miuix-android")
     }
     implementation("io.github.kyant0:capsule:2.1.3")
+    implementation("org.luckypray:dexkit:2.2.0")
 }
