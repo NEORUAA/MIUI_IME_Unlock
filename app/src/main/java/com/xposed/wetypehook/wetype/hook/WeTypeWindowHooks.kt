@@ -16,11 +16,14 @@ import android.view.ViewOutlineProvider
 import android.view.Window
 import android.view.inputmethod.EditorInfo
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import androidx.core.graphics.drawable.toDrawable
 import com.xposed.wetypehook.xposed.Log
 import com.xposed.wetypehook.xposed.HookEnvironment
+import com.xposed.wetypehook.xposed.findMethodInHierarchy
 import com.xposed.wetypehook.xposed.getObjectAs
 import com.xposed.wetypehook.xposed.hookAfter
+import com.xposed.wetypehook.xposed.hookBefore
 import com.xposed.wetypehook.xposed.invokeMethodAs
 import com.xposed.wetypehook.xposed.loadClassOrNull
 import com.xposed.wetypehook.wetype.graphics.WeTypeBloomStrokeDrawable
@@ -38,10 +41,21 @@ private const val WETYPE_COLLAPSED_IME_HEIGHT_THRESHOLD_PX = 2
 private const val WETYPE_HARDWARE_VIEW_CLASS_PREFIX = "com.tencent.wetype.plugin.hld.hardware."
 private const val WETYPE_CANDIDATE_VIEW_CLASS_NAME =
     "com.tencent.wetype.plugin.hld.candidate.ImeCandidateView"
+private const val WETYPE_SETTINGS_KEYBOARD_CLASS_NAME =
+    "com.tencent.wetype.plugin.hld.keyboard.S10SettingsKeyboard"
+private const val WETYPE_SETTINGS_RECYCLER_VIEW_CLASS_NAME =
+    "com.tencent.wetype.plugin.hld.view.settingkeyboard.S10SettingRecyclerView"
+private const val WETYPE_SETTING_VIEW_PACKAGE_PREFIX =
+    "com.tencent.wetype.plugin.hld.view.settingkeyboard."
 
 private val WETYPE_TRANSPARENT_OVERLAY_CLASS_NAMES = setOf(
     "com.tencent.wetype.plugin.hld.keyboard.selfdraw.S11EmojiKeyboard",
     "com.tencent.wetype.plugin.hld.keyboard.S15CustomPhraseAndClipboardKeyboard"
+)
+
+private val WETYPE_INTERNAL_SETTING_OVERLAY_CLASS_NAMES = setOf(
+    "${WETYPE_SETTING_VIEW_PACKAGE_PREFIX}S10SettingKeyboardTypeView",
+    "${WETYPE_SETTING_VIEW_PACKAGE_PREFIX}S10SettingCustomToolbarView"
 )
 
 private val WETYPE_HARDWARE_VIEW_ID_NAMES = arrayOf(
@@ -114,6 +128,9 @@ internal object WeTypeWindowHooks {
     private val overlayContainerByRoot = WeakHashMap<View, WeakReference<ViewGroup>>()
     private val coveredUnderlayOriginalVisibilities =
         WeakHashMap<ViewGroup, MutableMap<View, Int>>()
+    private val internalSettingUnderlayOriginalVisibilities =
+        WeakHashMap<ViewGroup, MutableMap<View, Int>>()
+    private val internalSettingContainerByOverlay = WeakHashMap<View, WeakReference<ViewGroup>>()
     private val overlaySyncPosted = WeakHashMap<ViewGroup, Boolean>()
     private val overlayVisibilityWrite = ThreadLocal<Boolean>()
     private var weTypeKeyboardBaseClass: Class<*>? = null
@@ -128,6 +145,7 @@ internal object WeTypeWindowHooks {
                 .flatMap { originals -> originals.entries.toList() }
         }
         val cleaned = runOnMainThreadBlocking {
+            restoreAllInternalSettingUnderlays()
             coveredUnderlayVisibilities.forEach { (view, visibility) ->
                 if (view.visibility == View.INVISIBLE) {
                     setOverlayManagedVisibility(view, visibility)
@@ -161,6 +179,8 @@ internal object WeTypeWindowHooks {
                 overlayRootsByContainer.clear()
                 overlayContainerByRoot.clear()
                 coveredUnderlayOriginalVisibilities.clear()
+                internalSettingUnderlayOriginalVisibilities.clear()
+                internalSettingContainerByOverlay.clear()
                 overlaySyncPosted.clear()
                 weTypeKeyboardBaseClass = null
                 weTypeCandidateViewClass = null
@@ -191,22 +211,29 @@ internal object WeTypeWindowHooks {
                     reconcileShownOverlayRoot(param.thisObject as? View)
                 }
             }
+            hookInternalSettingOverlays()
             View::class.java.getDeclaredMethod(
                 "onVisibilityChanged",
                 View::class.java,
                 Int::class.javaPrimitiveType
             ).apply { isAccessible = true }.hookAfter { param ->
-                reconcileOverlayRelatedView(param.thisObject as? View)
+                val view = param.thisObject as? View
+                reconcileInternalSettingOverlay(view)
+                reconcileOverlayRelatedView(view)
             }
             View::class.java.getDeclaredMethod("onAttachedToWindow")
                 .apply { isAccessible = true }
                 .hookAfter { param ->
-                    reconcileOverlayRelatedView(param.thisObject as? View)
+                    val view = param.thisObject as? View
+                    reconcileInternalSettingOverlay(view)
+                    reconcileOverlayRelatedView(view)
                 }
             View::class.java.getDeclaredMethod("onDetachedFromWindow")
                 .apply { isAccessible = true }
                 .hookAfter { param ->
-                    reconcileDetachedOverlayRelatedView(param.thisObject as? View)
+                    val view = param.thisObject as? View
+                    reconcileInternalSettingOverlay(view)
+                    reconcileDetachedOverlayRelatedView(view)
                 }
             val inputMethodService = loadClassOrNull("android.inputmethodservice.InputMethodService")
             runCatching {
@@ -383,6 +410,7 @@ internal object WeTypeWindowHooks {
     }
 
     private fun restoreAllCoveredUnderlays(clearTrackedRoots: Boolean) {
+        restoreAllInternalSettingUnderlays()
         val containers = synchronized(overlayStateLock) {
             coveredUnderlayOriginalVisibilities.keys.toList()
         }
@@ -425,6 +453,163 @@ internal object WeTypeWindowHooks {
         }
         visit(root)
         return result
+    }
+
+    private fun hookInternalSettingOverlays() {
+        runCatching {
+            val renderMethods = WETYPE_INTERNAL_SETTING_OVERLAY_CLASS_NAMES
+                .map { className ->
+                    val overlayClass = loadClassOrNull(className)
+                        ?: error("Failed to resolve $className")
+                    overlayClass.findMethodInHierarchy {
+                        returnType == Void.TYPE &&
+                            parameterTypes.contentEquals(
+                                arrayOf(
+                                    View::class.java,
+                                    Bundle::class.java,
+                                    Boolean::class.javaPrimitiveType
+                                )
+                            )
+                    }
+                }
+                .distinct()
+            renderMethods.forEach { renderMethod ->
+                renderMethod.hookBefore { param ->
+                    val overlay = param.thisObject as? View
+                    hideInternalSettingUnderlay(overlay)
+                    overlay?.let { view ->
+                        HookEnvironment.postTracked(view) {
+                            reconcileInternalSettingOverlay(view)
+                        }
+                    }
+                }
+            }
+            Log.i("Success: Hook WeType internal setting overlay underlay visibility")
+        }.onFailure { error ->
+            Log.i("Failed: Hook WeType internal setting overlay underlay visibility")
+            Log.i(error)
+        }
+    }
+
+    private fun hideInternalSettingUnderlay(target: View?) {
+        val overlay = target?.takeIf { view ->
+            view.javaClass.name in WETYPE_INTERNAL_SETTING_OVERLAY_CLASS_NAMES &&
+                hasAncestorClass(view, WETYPE_SETTINGS_KEYBOARD_CLASS_NAME)
+        } ?: return
+        val container = overlay.parent as? ViewGroup ?: return
+        synchronized(overlayStateLock) {
+            internalSettingContainerByOverlay[overlay] = WeakReference(container)
+        }
+        hideInternalSettingUnderlay(container)
+    }
+
+    private fun hideInternalSettingUnderlay(container: ViewGroup) {
+        val underlays = buildList {
+            repeat(container.childCount) { index ->
+                val child = container.getChildAt(index)
+                if (
+                    child is LinearLayout &&
+                    child.visibility == View.VISIBLE &&
+                    containsDescendantClass(child, WETYPE_SETTINGS_RECYCLER_VIEW_CLASS_NAME)
+                ) {
+                    add(child)
+                }
+            }
+        }
+        val rootsToHide = synchronized(overlayStateLock) {
+            val originals = internalSettingUnderlayOriginalVisibilities
+                .getOrPut(container) { WeakHashMap() }
+            underlays.filter { underlay ->
+                if (!originals.containsKey(underlay)) {
+                    originals[underlay] = underlay.visibility
+                }
+                true
+            }
+        }
+        rootsToHide.forEach { underlay ->
+            setOverlayManagedVisibility(underlay, View.INVISIBLE)
+        }
+    }
+
+    private fun reconcileInternalSettingOverlay(view: View?) {
+        val overlay = view?.takeIf { candidate ->
+            candidate.javaClass.name in WETYPE_INTERNAL_SETTING_OVERLAY_CLASS_NAMES
+        } ?: return
+        val container = resolveInternalSettingContainer(overlay) ?: return
+        val hasVisibleOverlay = buildList {
+            repeat(container.childCount) { index -> add(container.getChildAt(index)) }
+        }.any { child ->
+            child.javaClass.name in WETYPE_INTERNAL_SETTING_OVERLAY_CLASS_NAMES &&
+                child.isAttachedToWindow &&
+                child.isShown
+        }
+        if (hasVisibleOverlay) {
+            hideInternalSettingUnderlay(container)
+        } else {
+            restoreInternalSettingUnderlay(container)
+        }
+        if (!overlay.isAttachedToWindow) {
+            synchronized(overlayStateLock) {
+                internalSettingContainerByOverlay.remove(overlay)
+            }
+        }
+    }
+
+    private fun restoreInternalSettingUnderlay(container: ViewGroup) {
+        val originals = synchronized(overlayStateLock) {
+            internalSettingUnderlayOriginalVisibilities.remove(container)
+                ?.entries
+                ?.toList()
+                .orEmpty()
+        }
+        originals.forEach { (underlay, visibility) ->
+            if (underlay.visibility == View.INVISIBLE) {
+                setOverlayManagedVisibility(underlay, visibility)
+            }
+        }
+    }
+
+    private fun restoreAllInternalSettingUnderlays() {
+        val containers = synchronized(overlayStateLock) {
+            internalSettingUnderlayOriginalVisibilities.keys.toList()
+        }
+        containers.forEach(::restoreInternalSettingUnderlay)
+        synchronized(overlayStateLock) {
+            internalSettingContainerByOverlay.clear()
+        }
+    }
+
+    private fun resolveInternalSettingContainer(overlay: View): ViewGroup? {
+        val attachedContainer = (overlay.parent as? ViewGroup)?.takeIf {
+            hasAncestorClass(overlay, WETYPE_SETTINGS_KEYBOARD_CLASS_NAME)
+        }
+        if (attachedContainer != null) {
+            synchronized(overlayStateLock) {
+                internalSettingContainerByOverlay[overlay] = WeakReference(attachedContainer)
+            }
+            return attachedContainer
+        }
+        return synchronized(overlayStateLock) {
+            internalSettingContainerByOverlay[overlay]?.get()
+        }
+    }
+
+    private fun containsDescendantClass(root: View, className: String): Boolean {
+        if (root.javaClass.name == className) return true
+        if (root !is ViewGroup) return false
+        repeat(root.childCount) { index ->
+            if (containsDescendantClass(root.getChildAt(index), className)) return true
+        }
+        return false
+    }
+
+    private fun hasAncestorClass(view: View, className: String): Boolean {
+        var current = view.parent as? View
+        while (current != null) {
+            if (current.javaClass.name == className) return true
+            current = current.parent as? View
+        }
+        return false
     }
 
     private fun isWeTypeKeyboardRoot(view: View): Boolean =

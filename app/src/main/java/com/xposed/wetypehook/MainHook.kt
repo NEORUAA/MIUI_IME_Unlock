@@ -316,7 +316,6 @@ class MainHook : XposedModule() {
         HookEnvironment.withHookScope("wetype.candidate-margin") { hookWeTypeCandidateBackgroundLeftMargin() }
         HookEnvironment.withHookScope("wetype.candidate-corner") { hookWeTypeCandidateBackgroundCorner() }
         HookEnvironment.withHookScope("wetype.pinyin-margin") { hookWeTypeCandidatePinyinLeftMargin() }
-        HookEnvironment.withHookScope("wetype.settings-background") { hookWeTypeSettingKeyboardOpaqueBackground() }
         HookEnvironment.withHookScope("wetype.window-blur") { hookWeTypeWindowBlur() }
         HookEnvironment.withHookScope("wetype.window-corner") { hookWeTypeWindowCorner() }
         HookEnvironment.withHookScope("wetype.disable-update") { hookWeTypeDisableHotUpdate() }
@@ -682,10 +681,6 @@ class MainHook : XposedModule() {
 
     private fun hookWeTypeCandidatePinyinLeftMargin() {
         WeTypeResourceHooks.hookCandidatePinyinLeftMargin()
-    }
-
-    private fun hookWeTypeSettingKeyboardOpaqueBackground() {
-        WeTypeResourceHooks.hookSettingKeyboardOpaqueBackground()
     }
 
     private fun hookWeTypeWindowCorner() {
