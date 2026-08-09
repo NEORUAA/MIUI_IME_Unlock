@@ -50,7 +50,8 @@ private const val WETYPE_SETTING_VIEW_PACKAGE_PREFIX =
 
 private val WETYPE_TRANSPARENT_OVERLAY_CLASS_NAMES = setOf(
     "com.tencent.wetype.plugin.hld.keyboard.selfdraw.S11EmojiKeyboard",
-    "com.tencent.wetype.plugin.hld.keyboard.S15CustomPhraseAndClipboardKeyboard"
+    "com.tencent.wetype.plugin.hld.keyboard.S15CustomPhraseAndClipboardKeyboard",
+    "com.tencent.wetype.plugin.hld.keyboard.S34ClipboardBombKeyboard"
 )
 
 private val WETYPE_INTERNAL_SETTING_OVERLAY_CLASS_NAMES = setOf(
