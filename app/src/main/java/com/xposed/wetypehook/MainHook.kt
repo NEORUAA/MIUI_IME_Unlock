@@ -121,16 +121,6 @@ class MainHook : XposedModule() {
         val isClickable: Boolean
     )
 
-    private val supportedPackages = setOf(
-        MIUI_PHRASE_PACKAGE,
-        "com.iflytek.inputmethod.miui",
-        "com.sohu.inputmethod.sogou.xiaomi",
-        "com.baidu.input_mi",
-        "com.google.android.inputmethod.latin",
-        WETYPE_PACKAGE,
-        "com.xiaomi.type"
-    )
-
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         HookEnvironment.attach(this, null, TAG)
         modulePath = moduleApplicationInfo.sourceDir
@@ -159,11 +149,8 @@ class MainHook : XposedModule() {
 
     override fun onPackageReady(param: PackageReadyParam) {
         val packageName = param.packageName
-        if (packageName !in supportedPackages) {
-            if (param.isFirstPackage) {
-                Log.i("Detach from out-of-scope first package $packageName")
-                detach()
-            }
+        if (!param.isFirstPackage) {
+            Log.i("Skip secondary package $packageName")
             return
         }
 
