@@ -81,13 +81,6 @@ private val WETYPE_COLOR_REPLACEMENTS = mapOf(
     "ime_skin_dark_keyboard_end_color" to Color.TRANSPARENT,
     "ime_skin_keyboard_end_color" to Color.TRANSPARENT
 )
-private val WETYPE_DRAWABLE_REPLACEMENTS = mapOf(
-    "ime_emoji_keyboard_gradient_bg_color" to R.drawable.wetype_full_gradient_bg,
-    "ime_keyboard_full_gradient_bg_color" to R.drawable.wetype_full_gradient_bg,
-    "ime_emoji_keyboard_gradient_bg_color_dark" to R.drawable.wetype_full_gradient_bg_dark,
-    "ime_keyboard_full_gradient_bg_color_dark" to R.drawable.wetype_full_gradient_bg_dark
-)
-
 class MainHook : XposedModule() {
     private val miuiImeList = setOf(
         "com.iflytek.inputmethod.miui",
@@ -110,7 +103,6 @@ class MainHook : XposedModule() {
     private var bottomViewSourceColor: Int? = null
     private var modulePath: String? = null
     private var moduleAssetManager: AssetManager? = null
-    private var moduleResources: Resources? = null
     private var assetManagerAddAssetPathMethod: Method? = null
     private var viewListenerInfoField: Field? = null
     private var onClickListenerField: Field? = null
@@ -316,7 +308,7 @@ class MainHook : XposedModule() {
         HookEnvironment.withHookScope("wetype.activation") { hookActivationHeartbeat(sourcePackage) }
         HookEnvironment.withHookScope("wetype.font") { hookWeTypeFont() }
         HookEnvironment.withHookScope("wetype.colors") { hookWeTypeTransparentColors() }
-        HookEnvironment.withHookScope("wetype.xml-drawables") { hookWeTypeXmlDrawables() }
+        HookEnvironment.withHookScope("wetype.overlay-underlay") { WeTypeWindowHooks.hookTransparentOverlayUnderlay() }
         HookEnvironment.withHookScope("wetype.self-draw-colors") { hookWeTypeSelfDrawKeyColors() }
         HookEnvironment.withHookScope("wetype.key-corner") { hookWeTypeKeyboardKeyCorner() }
         HookEnvironment.withHookScope("wetype.candidate-text") { hookWeTypeCandidateSpecialTextColor() }
@@ -660,13 +652,6 @@ class MainHook : XposedModule() {
         )
     }
 
-    private fun hookWeTypeXmlDrawables() {
-        WeTypeResourceHooks.hookXmlDrawables(
-            drawableReplacements = WETYPE_DRAWABLE_REPLACEMENTS,
-            getModuleResources = ::getModuleResources
-        )
-    }
-
     private fun hookWeTypeTransparentColors() {
         WeTypeResourceHooks.hookAppearanceColors(WETYPE_COLOR_REPLACEMENTS)
     }
@@ -822,15 +807,6 @@ class MainHook : XposedModule() {
         }
         moduleAssetManager = assetManager
         return assetManager
-    }
-
-    private fun getModuleResources(baseResources: Resources): Resources {
-        moduleResources?.let { return it }
-        return Resources(
-            getModuleAssetManager(),
-            baseResources.displayMetrics,
-            baseResources.configuration
-        ).also { moduleResources = it }
     }
 
     private fun hookSIsImeSupport(clazz: Class<*>) {
@@ -1238,7 +1214,6 @@ class MainHook : XposedModule() {
         bottomViewSourceColor = null
         runCatching { moduleAssetManager?.close() }
         moduleAssetManager = null
-        moduleResources = null
         assetManagerAddAssetPathMethod = null
         viewListenerInfoField = null
         onClickListenerField = null

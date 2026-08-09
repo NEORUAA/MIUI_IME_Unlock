@@ -6,6 +6,7 @@ import android.graphics.Outline
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.inputmethodservice.InputMethodService
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.RoundedCorner
@@ -26,6 +27,7 @@ import com.xposed.wetypehook.wetype.graphics.WeTypeBloomStrokeDrawable
 import com.xposed.wetypehook.wetype.graphics.WeTypeCornerRadii
 import com.xposed.wetypehook.wetype.graphics.createWeTypeContinuousRoundedPath
 import com.xposed.wetypehook.wetype.settings.WeTypeSettings
+import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -34,6 +36,13 @@ private const val WETYPE_BLUR_APPLY_MAX_RETRY = 6
 private const val WETYPE_BACKGROUND_SETTLE_RETRY = 3
 private const val WETYPE_COLLAPSED_IME_HEIGHT_THRESHOLD_PX = 2
 private const val WETYPE_HARDWARE_VIEW_CLASS_PREFIX = "com.tencent.wetype.plugin.hld.hardware."
+private const val WETYPE_CANDIDATE_VIEW_CLASS_NAME =
+    "com.tencent.wetype.plugin.hld.candidate.ImeCandidateView"
+
+private val WETYPE_TRANSPARENT_OVERLAY_CLASS_NAMES = setOf(
+    "com.tencent.wetype.plugin.hld.keyboard.selfdraw.S11EmojiKeyboard",
+    "com.tencent.wetype.plugin.hld.keyboard.S15CustomPhraseAndClipboardKeyboard"
+)
 
 private val WETYPE_HARDWARE_VIEW_ID_NAMES = arrayOf(
     "hardware_keyboard_candidate_container_view",
@@ -99,12 +108,31 @@ internal object WeTypeWindowHooks {
     }
 
     private val weTypeWindowStates = WeakHashMap<Any, WeTypeWindowState>()
+    private val overlayStateLock = Any()
+    private val overlayRootsByContainer =
+        WeakHashMap<ViewGroup, MutableMap<View, Boolean>>()
+    private val overlayContainerByRoot = WeakHashMap<View, WeakReference<ViewGroup>>()
+    private val coveredUnderlayOriginalVisibilities =
+        WeakHashMap<ViewGroup, MutableMap<View, Int>>()
+    private val overlaySyncPosted = WeakHashMap<ViewGroup, Boolean>()
+    private val overlayVisibilityWrite = ThreadLocal<Boolean>()
+    private var weTypeKeyboardBaseClass: Class<*>? = null
+    private var weTypeCandidateViewClass: Class<*>? = null
 
     fun prepareForHotReload(): Boolean {
         val states = synchronized(weTypeWindowStates) {
             weTypeWindowStates.values.toList()
         }
+        val coveredUnderlayVisibilities = synchronized(overlayStateLock) {
+            coveredUnderlayOriginalVisibilities.values
+                .flatMap { originals -> originals.entries.toList() }
+        }
         val cleaned = runOnMainThreadBlocking {
+            coveredUnderlayVisibilities.forEach { (view, visibility) ->
+                if (view.visibility == View.INVISIBLE) {
+                    setOverlayManagedVisibility(view, visibility)
+                }
+            }
             states.forEach { state ->
                 state.blurApplyToken++
                 state.windowVisible = false
@@ -129,8 +157,323 @@ internal object WeTypeWindowHooks {
             synchronized(weTypeWindowStates) {
                 weTypeWindowStates.clear()
             }
+            synchronized(overlayStateLock) {
+                overlayRootsByContainer.clear()
+                overlayContainerByRoot.clear()
+                coveredUnderlayOriginalVisibilities.clear()
+                overlaySyncPosted.clear()
+                weTypeKeyboardBaseClass = null
+                weTypeCandidateViewClass = null
+            }
         }
         return cleaned
+    }
+
+    fun hookTransparentOverlayUnderlay() {
+        runCatching {
+            val overlayClasses = WETYPE_TRANSPARENT_OVERLAY_CLASS_NAMES.mapNotNull(::loadClassOrNull)
+            check(overlayClasses.size == WETYPE_TRANSPARENT_OVERLAY_CLASS_NAMES.size) {
+                "Failed to resolve WeType transparent overlay keyboards"
+            }
+            weTypeKeyboardBaseClass = findNearestCommonKeyboardBaseClass(overlayClasses)
+            weTypeCandidateViewClass = checkNotNull(loadClassOrNull(WETYPE_CANDIDATE_VIEW_CLASS_NAME)) {
+                "Failed to resolve WeType candidate view"
+            }
+            val overlayShowMethods = overlayClasses.map { overlayClass ->
+                overlayClass.declaredMethods.single { method ->
+                    method.returnType == Void.TYPE &&
+                        method.parameterTypes.size == 2 &&
+                        method.parameterTypes[1] == Bundle::class.java
+                }.apply { isAccessible = true }
+            }
+            overlayShowMethods.forEach { showMethod ->
+                showMethod.hookAfter { param ->
+                    reconcileShownOverlayRoot(param.thisObject as? View)
+                }
+            }
+            View::class.java.getDeclaredMethod(
+                "onVisibilityChanged",
+                View::class.java,
+                Int::class.javaPrimitiveType
+            ).apply { isAccessible = true }.hookAfter { param ->
+                reconcileOverlayRelatedView(param.thisObject as? View)
+            }
+            View::class.java.getDeclaredMethod("onAttachedToWindow")
+                .apply { isAccessible = true }
+                .hookAfter { param ->
+                    reconcileOverlayRelatedView(param.thisObject as? View)
+                }
+            View::class.java.getDeclaredMethod("onDetachedFromWindow")
+                .apply { isAccessible = true }
+                .hookAfter { param ->
+                    reconcileDetachedOverlayRelatedView(param.thisObject as? View)
+                }
+            val inputMethodService = loadClassOrNull("android.inputmethodservice.InputMethodService")
+            runCatching {
+                inputMethodService?.getMethod("onWindowShown")?.hookAfter {
+                    scheduleKnownOverlayContainers()
+                }
+            }
+            runCatching {
+                inputMethodService?.getMethod("onWindowHidden")?.hookAfter {
+                    restoreAllCoveredUnderlays(clearTrackedRoots = false)
+                }
+            }
+            runCatching {
+                inputMethodService?.getMethod("onDestroy")?.hookAfter {
+                    restoreAllCoveredUnderlays(clearTrackedRoots = true)
+                }
+            }
+            Log.i("Success: Hook WeType transparent overlay underlay visibility")
+        }.onFailure {
+            Log.i("Failed: Hook WeType transparent overlay underlay visibility")
+            Log.i(it)
+        }
+    }
+
+    private fun reconcileOverlayRelatedView(view: View?) {
+        if (overlayVisibilityWrite.get() == true) return
+        val relatedView = view?.takeIf {
+            isWeTypeKeyboardRoot(it) || isWeTypeCandidateView(it)
+        } ?: return
+        val isOverlayRoot = relatedView.javaClass.name in WETYPE_TRANSPARENT_OVERLAY_CLASS_NAMES
+        val container = if (isOverlayRoot) {
+            findOverlayKeyboardContainer(relatedView)
+        } else {
+            findTrackedOverlayContainer(relatedView)
+        } ?: return
+        if (isOverlayRoot) {
+            registerOverlayRoot(container, relatedView)
+        }
+        scheduleOverlayUnderlaySync(container)
+    }
+
+    private fun reconcileShownOverlayRoot(view: View?) {
+        val overlayRoot = view?.takeIf {
+            it.javaClass.name in WETYPE_TRANSPARENT_OVERLAY_CLASS_NAMES
+        } ?: return
+        fun registerWhenAttached(retriesRemaining: Int) {
+            val container = findOverlayKeyboardContainer(overlayRoot)
+            if (container != null) {
+                registerOverlayRoot(container, overlayRoot)
+                scheduleOverlayUnderlaySync(container)
+            } else if (retriesRemaining > 0) {
+                HookEnvironment.postTracked(overlayRoot, 32L) {
+                    registerWhenAttached(retriesRemaining - 1)
+                }
+            }
+        }
+        registerWhenAttached(retriesRemaining = 5)
+    }
+
+    private fun registerOverlayRoot(container: ViewGroup, overlayRoot: View) {
+        synchronized(overlayStateLock) {
+            overlayRootsByContainer
+                .getOrPut(container) { WeakHashMap() }[overlayRoot] = true
+            overlayContainerByRoot[overlayRoot] = WeakReference(container)
+        }
+    }
+
+    private fun reconcileDetachedOverlayRelatedView(view: View?) {
+        if (overlayVisibilityWrite.get() == true) return
+        val relatedView = view?.takeIf {
+            isWeTypeKeyboardRoot(it) || isWeTypeCandidateView(it)
+        } ?: return
+        val container = synchronized(overlayStateLock) {
+            overlayContainerByRoot[relatedView]?.get()
+                ?: coveredUnderlayOriginalVisibilities.keys.firstOrNull { trackedContainer ->
+                    coveredUnderlayOriginalVisibilities[trackedContainer]?.containsKey(relatedView) == true
+                }
+        } ?: return
+        scheduleOverlayUnderlaySync(container)
+    }
+
+    private fun scheduleOverlayUnderlaySync(container: ViewGroup) {
+        val shouldPost = synchronized(overlayStateLock) {
+            if (overlaySyncPosted[container] == true) {
+                false
+            } else {
+                overlaySyncPosted[container] = true
+                true
+            }
+        }
+        if (!shouldPost) return
+
+        val posted = HookEnvironment.postTracked(container) {
+            synchronized(overlayStateLock) { overlaySyncPosted.remove(container) }
+            syncOverlayUnderlay(container)
+            HookEnvironment.postTracked(container, 48L) { syncOverlayUnderlay(container) }
+            HookEnvironment.postTracked(container, 144L) { syncOverlayUnderlay(container) }
+        }
+        if (!posted) {
+            synchronized(overlayStateLock) { overlaySyncPosted.remove(container) }
+            syncOverlayUnderlay(container)
+        }
+    }
+
+    private fun syncOverlayUnderlay(container: ViewGroup) {
+        val visibleOverlayRoots = synchronized(overlayStateLock) {
+            overlayRootsByContainer[container]
+                ?.keys
+                ?.filter { root ->
+                    root.isAttachedToWindow &&
+                        root.isShown &&
+                        isDescendantOf(root, container)
+                }
+                .orEmpty()
+                .toSet()
+        }
+        if (visibleOverlayRoots.isNotEmpty()) {
+            hideCoveredUnderlays(container, visibleOverlayRoots)
+        } else {
+            restoreCoveredUnderlays(container)
+        }
+    }
+
+    private fun hideCoveredUnderlays(
+        container: ViewGroup,
+        visibleOverlayRoots: Set<View>
+    ) {
+        val coveredUnderlays = findCoveredUnderlays(container)
+        val rootsToRestore = mutableListOf<Pair<View, Int>>()
+        val rootsToHide = mutableListOf<View>()
+        synchronized(overlayStateLock) {
+            val originals = coveredUnderlayOriginalVisibilities
+                .getOrPut(container) { WeakHashMap() }
+            visibleOverlayRoots.forEach { overlayRoot ->
+                originals.remove(overlayRoot)?.let { visibility ->
+                    rootsToRestore += overlayRoot to visibility
+                }
+            }
+            coveredUnderlays.forEach { underlay ->
+                if (
+                    underlay !in visibleOverlayRoots &&
+                    underlay.visibility == View.VISIBLE &&
+                    underlay.isShown
+                ) {
+                    if (!originals.containsKey(underlay)) {
+                        originals[underlay] = underlay.visibility
+                    }
+                    rootsToHide += underlay
+                }
+            }
+        }
+        rootsToRestore.forEach { (view, visibility) ->
+            if (view.visibility == View.INVISIBLE) {
+                setOverlayManagedVisibility(view, visibility)
+            }
+        }
+        rootsToHide.forEach { underlay ->
+            setOverlayManagedVisibility(underlay, View.INVISIBLE)
+        }
+    }
+
+    private fun restoreCoveredUnderlays(container: ViewGroup) {
+        val originals = synchronized(overlayStateLock) {
+            coveredUnderlayOriginalVisibilities.remove(container)
+                ?.entries
+                ?.toList()
+                .orEmpty()
+        }
+        originals.forEach { (view, visibility) ->
+            if (view.visibility == View.INVISIBLE) {
+                setOverlayManagedVisibility(view, visibility)
+            }
+        }
+    }
+
+    private fun restoreAllCoveredUnderlays(clearTrackedRoots: Boolean) {
+        val containers = synchronized(overlayStateLock) {
+            coveredUnderlayOriginalVisibilities.keys.toList()
+        }
+        containers.forEach(::restoreCoveredUnderlays)
+        if (clearTrackedRoots) {
+            synchronized(overlayStateLock) {
+                overlayRootsByContainer.clear()
+                overlayContainerByRoot.clear()
+                overlaySyncPosted.clear()
+            }
+        }
+    }
+
+    private fun scheduleKnownOverlayContainers() {
+        val containers = synchronized(overlayStateLock) {
+            overlayRootsByContainer.keys.toList()
+        }
+        containers.forEach(::scheduleOverlayUnderlaySync)
+    }
+
+    private fun setOverlayManagedVisibility(view: View, visibility: Int) {
+        overlayVisibilityWrite.set(true)
+        try {
+            view.visibility = visibility
+        } finally {
+            overlayVisibilityWrite.remove()
+        }
+    }
+
+    private fun findCoveredUnderlays(root: View): List<View> {
+        val result = mutableListOf<View>()
+        fun visit(view: View) {
+            if (isWeTypeKeyboardRoot(view) || isWeTypeCandidateView(view)) {
+                result += view
+                return
+            }
+            if (view is ViewGroup) {
+                repeat(view.childCount) { index -> visit(view.getChildAt(index)) }
+            }
+        }
+        visit(root)
+        return result
+    }
+
+    private fun isWeTypeKeyboardRoot(view: View): Boolean =
+        weTypeKeyboardBaseClass?.isInstance(view) == true
+
+    private fun isWeTypeCandidateView(view: View): Boolean =
+        weTypeCandidateViewClass?.isInstance(view) == true
+
+    private fun findNearestCommonKeyboardBaseClass(classes: List<Class<*>>): Class<*> {
+        var candidate: Class<*>? = classes.firstOrNull()
+        while (candidate != null && classes.any { !candidate.isAssignableFrom(it) }) {
+            candidate = candidate.superclass
+        }
+        val resolved = checkNotNull(candidate) { "Failed to resolve common WeType keyboard base" }
+        check(
+            View::class.java.isAssignableFrom(resolved) &&
+                resolved != View::class.java &&
+                resolved != ViewGroup::class.java &&
+                resolved.methods.any { method ->
+                    method.name == "getKeyboardType" && method.parameterCount == 0
+                }
+        ) { "Invalid common WeType keyboard base: ${resolved.name}" }
+        return resolved
+    }
+
+    private fun findOverlayKeyboardContainer(view: View): ViewGroup? {
+        val overlayHost = view.parent as? ViewGroup ?: return null
+        return overlayHost.parent as? ViewGroup
+    }
+
+    private fun findTrackedOverlayContainer(view: View): ViewGroup? {
+        val trackedContainers = synchronized(overlayStateLock) {
+            overlayRootsByContainer.keys.toSet()
+        }
+        var current: View? = view.parent as? View
+        while (current != null) {
+            if (current is ViewGroup && current in trackedContainers) return current
+            current = current.parent as? View
+        }
+        return null
+    }
+
+    private fun isDescendantOf(view: View, ancestor: ViewGroup): Boolean {
+        var current: View? = view
+        while (current != null) {
+            if (current === ancestor) return true
+            current = current.parent as? View
+        }
+        return false
     }
 
     fun hookWindowBlur() {
