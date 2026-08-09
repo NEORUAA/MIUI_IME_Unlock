@@ -1120,7 +1120,9 @@ class MainHook : XposedModule() {
             currentProcessInputMethodServices().forEach(
                 WeTypeWindowHooks::reconcileCurrentInputMethodService
             )
-            WeTypeResourceHooks.reconcileCurrentKeyboardLogos(currentProcessWindowViews())
+            val windowViews = currentProcessWindowViews()
+            WeTypeWindowHooks.reconcileCurrentOverlayUnderlays(windowViews)
+            WeTypeResourceHooks.reconcileCurrentKeyboardLogos(windowViews)
         }
         if (!reconciled) {
             Log.e("Failed:Reconcile current WeType UI after hot reload")
