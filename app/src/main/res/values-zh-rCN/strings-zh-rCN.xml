@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">WeType 美化</string>
-    <string name="xposeddescription">解锁 MIUI 全面屏键盘限制，并自定义微信输入法窗口外观。</string>
+    <string name="xposeddescription">为微信输入法提供界面美化优化，同时为作用域输入法解锁 MIUI 全面屏优化限制</string>
 
     <string name="settings_title">WeType 美化</string>
     <string name="settings_summary">输入法窗口</string>
